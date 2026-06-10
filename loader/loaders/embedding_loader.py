@@ -46,6 +46,8 @@ _BATCH_SIZE: int = int(os.getenv("OLLAMA_EMBED_BATCH_SIZE", "32"))
 
 _PROVIDER: str = "ollama"
 _API_KEY: str = ""
+_AZURE_ENDPOINT: str = ""
+_AZURE_API_VERSION: str = "2024-02-01"
 _GOOGLE_BASE = "https://generativelanguage.googleapis.com"
 
 
@@ -54,7 +56,7 @@ def configure(values: dict) -> None:
     'embedding' group). The worker calls this at the start of each embed job so
     batch embedding uses the current DB-configured provider/endpoint/model
     without a restart. Embed jobs share a single resource so this never races."""
-    global _BASE_URL, _MODEL, _DIMENSIONS, _TIMEOUT, _BATCH_SIZE, _PROVIDER, _API_KEY
+    global _BASE_URL, _MODEL, _DIMENSIONS, _TIMEOUT, _BATCH_SIZE, _PROVIDER, _API_KEY, _AZURE_ENDPOINT, _AZURE_API_VERSION
     _PROVIDER = str(values.get("provider", "ollama") or "ollama").strip().lower()
     _BASE_URL = str(values.get("base_url", "") or "").rstrip("/")
     _API_KEY = str(values.get("api_key", "") or "")
@@ -62,6 +64,8 @@ def configure(values: dict) -> None:
     _DIMENSIONS = int(values.get("dimensions", 1024) or 1024)
     _TIMEOUT = float(values.get("timeout", 30) or 30)
     _BATCH_SIZE = int(values.get("batch_size", 32) or 32)
+    _AZURE_ENDPOINT = str(values.get("azure_endpoint", "") or "").rstrip("/")
+    _AZURE_API_VERSION = str(values.get("api_version", "2024-02-01") or "2024-02-01")
 
 # All (schema, table, column) triples that hold embedding vectors.
 # Used by ensure_dimensions() to ALTER TABLE when OLLAMA_EMBED_DIMENSIONS changes.
@@ -156,7 +160,7 @@ async def ensure_dimensions(pool: asyncpg.Pool) -> None:
 
 async def _check_ollama() -> bool:
     """Provider readiness check (name kept for callers). For ollama, pings
-    /api/version; for openai/google, confirms a base/key is present."""
+    /api/version; for openai/google/azure, confirms required config is present."""
     if _PROVIDER == "ollama":
         if not _BASE_URL:
             print("  Embedding base URL not set — skipping embedding generation")
@@ -172,7 +176,14 @@ async def _check_ollama() -> bool:
             pass
         print(f"  [error] Ollama not reachable at {_BASE_URL} — skipping embedding")
         return False
-    # openai / google: need a model and (api_key for openai/google)
+    if _PROVIDER == "azure":
+        if not _AZURE_ENDPOINT or not _MODEL or not _API_KEY:
+            print("  [error] Azure embedding needs endpoint, model, and API key — skipping")
+            return False
+        print(f"  azure embedding  endpoint={_AZURE_ENDPOINT}  deployment={_MODEL}"
+              f"  api_version={_AZURE_API_VERSION}  dimensions={_DIMENSIONS}  batch_size={_BATCH_SIZE}")
+        return True
+    # openai / google: need a model and api_key
     if not _MODEL or not _API_KEY:
         print(f"  [error] {_PROVIDER} embedding needs a model and API key — skipping")
         return False
@@ -196,6 +207,13 @@ async def _embed_batch(
 async def _provider_embed(client: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
     """Embed a batch of texts via the configured provider. Returns a list of
     vectors parallel to *texts*. Raises on HTTP error."""
+    if _PROVIDER == "azure":
+        url = f"{_AZURE_ENDPOINT}/openai/deployments/{_MODEL}/embeddings?api-version={_AZURE_API_VERSION}"
+        body: dict = {"input": texts, "encoding_format": "float"}
+        resp = await client.post(url, json=body, headers={"api-key": _API_KEY})
+        resp.raise_for_status()
+        data = sorted(resp.json().get("data", []), key=lambda d: d.get("index", 0))
+        return [d.get("embedding") for d in data]
     if _PROVIDER == "openai":
         base = _BASE_URL if _BASE_URL.endswith("/embeddings") else f"{_BASE_URL}/embeddings"
         body: dict = {"model": _MODEL, "input": texts, "encoding_format": "float"}
@@ -228,8 +246,16 @@ async def _provider_embed(client: httpx.AsyncClient, texts: list[str]) -> list[l
 async def _upsert(pool: asyncpg.Pool, sql: str, rows: list[tuple]) -> None:
     if not rows:
         return
-    async with pool.acquire() as conn:
-        await conn.executemany(sql, rows)
+    try:
+        async with pool.acquire() as conn:
+            await conn.executemany(sql, rows)
+    except asyncpg.InvalidCachedStatementError:
+        # ALTER TABLE (e.g. ensure_dimensions) invalidated cached plans on existing
+        # connections. Acquire a fresh connection and retry — the new connection has
+        # no stale plans.
+        async with pool.acquire() as conn:
+            await conn.execute("DISCARD PLANS")
+            await conn.executemany(sql, rows)
 
 
 def _text_hash(text: str) -> str:

@@ -5342,6 +5342,7 @@ async def _run_embed_job(
 
     _emb_cfg = await _admin_settings.get_group(pool, "embedding")
     _embedding_loader.configure(_emb_cfg)
+    _emb_provider = str(_emb_cfg.get("provider", "ollama") or "ollama").strip().lower()
     ollama_url = str(_emb_cfg.get("base_url", "") or "").strip()
     # Use current_step to gate phase resumption (progress_current tracks items, not steps)
     step_at_start = job.get("current_step", "")
@@ -5353,9 +5354,9 @@ async def _run_embed_job(
             job_id=job["job_id"],
             level="info",
             message=f"Validating {module_label} embedding job",
-            payload={"ollama_configured": bool(ollama_url)},
+            payload={"provider": _emb_provider},
         )
-        if not ollama_url:
+        if _emb_provider == "ollama" and not ollama_url:
             await mark_job_status(
                 pool,
                 job_id=job["job_id"],
@@ -5368,24 +5369,26 @@ async def _run_embed_job(
             return
 
         # Verify Ollama is actually reachable before committing to the job
-        _ollama_ok = False
-        try:
-            async with _httpx.AsyncClient(timeout=5.0) as _hc:
-                _r = await _hc.get(f"{ollama_url.rstrip('/')}/api/version")
-                _ollama_ok = _r.status_code == 200
-        except Exception:
-            pass
-        if not _ollama_ok:
-            await mark_job_status(
-                pool,
-                job_id=job["job_id"],
-                status="retryable_failed",
-                current_step="validate",
-                control_state="idle",
-                last_error_code="ollama_unreachable",
-                last_error_message=f"Ollama not reachable at {ollama_url} — check OLLAMA_BASE_URL",
-            )
-            return
+        # (non-Ollama providers are validated by the loader's _check_ollama() during embed)
+        if _emb_provider == "ollama":
+            _ollama_ok = False
+            try:
+                async with _httpx.AsyncClient(timeout=5.0) as _hc:
+                    _r = await _hc.get(f"{ollama_url.rstrip('/')}/api/version")
+                    _ollama_ok = _r.status_code == 200
+            except Exception:
+                pass
+            if not _ollama_ok:
+                await mark_job_status(
+                    pool,
+                    job_id=job["job_id"],
+                    status="retryable_failed",
+                    current_step="validate",
+                    control_state="idle",
+                    last_error_code="ollama_unreachable",
+                    last_error_message=f"Ollama not reachable at {ollama_url} — check OLLAMA_BASE_URL",
+                )
+                return
 
         async with pool.acquire() as _conn:
             source_count = int(await _conn.fetchval(source_count_query) or 0)
@@ -5440,8 +5443,8 @@ async def _run_embed_job(
         pool,
         job_id=job["job_id"],
         level="info",
-        message=f"Generating {module_label} embeddings via Ollama ({source_count:,} items)",
-        payload={"resumed": bool(step_at_start), "source_count": source_count},
+        message=f"Generating {module_label} embeddings via {_emb_provider} ({source_count:,} items)",
+        payload={"resumed": bool(step_at_start), "source_count": source_count, "provider": _emb_provider},
     )
     await record_job_step(
         pool,
@@ -5514,7 +5517,7 @@ async def _run_embed_job(
             pool,
             job_id=job["job_id"],
             level="warn",
-            message="No embeddings created — Ollama may have been unreachable during embedding",
+            message=f"No embeddings created — {_emb_provider} may have been unreachable during embedding",
         )
         await mark_job_status(
             pool,
@@ -5523,7 +5526,7 @@ async def _run_embed_job(
             current_step="embed",
             control_state="idle",
             last_error_code="zero_embeddings",
-            last_error_message="No embeddings were created — Ollama returned no vectors",
+            last_error_message=f"No embeddings were created — {_emb_provider} returned no vectors",
         )
         return
 
