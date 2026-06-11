@@ -1,48 +1,47 @@
 # 藥品服務模組 (Drug Service)
 
 ## 模組概述
-藥品服務模組整合了台灣衛生福利部食品藥物管理署（TFDA）的藥品許可證資料庫，提供權威且即時的藥品資訊查詢服務。本模組支援從一般民眾的用藥查詢到醫療專業人員的處方分析等多種應用場景。
+藥品服務模組整合台灣 FDA（TFDA）西藥許可證資料，提供藥品搜尋、藥錠外觀辨識、藥品詳情與官方文件資產（仿單 / 外盒標籤 / 外觀圖）下載連結。資料以 TFDA 的標準許可證索引為核心，再透過多階段管線逐步豐富。
 
 ## 主要功能
 
-### 1. 藥品查詢
-提供全方位的藥品搜尋機制：
-- **名稱搜尋**：支援中文名、英文名查詢（例如：「普拿疼」、「Panadol」）。
-- **適應症搜尋**：可透過症狀或疾病名稱搜尋相關藥品（例如：「頭痛」、「高血壓」）。
-- **證號查詢**：支援精確的許可證字號查詢。
+### 1. 藥品搜尋（`search_drug`）
+支援四種搜尋模式：
 
-### 2. 詳細藥品資訊
-提供每一項藥品的完整查驗登記資料：
-- **基本資料**：許可證字號、類別、劑型、有效日期。
-- **成份內容**：主成分（Active Ingredients）及其含量。
-- **仿單資訊**：適應症、用法用量、副作用、禁忌與注意事項。
-- **外觀描述**：藥品的顏色、形狀、標記等特徵。
-- **電子仿單**：提供官方 PDF 仿單連結。
+- **`drug_name`**：以中英文藥品名稱搜尋（例如「普拿疼」、「acetaminophen」）。
+- **`ingredient`**：以成分文字搜尋。
+- **`license_id`**：以許可證字號精確查詢（例如「衛署藥製字第000480號」或數字 ID）。
+- **`atc_code`**：以 ATC 分類碼搜尋（例如「N02BE01」）。
 
-### 3. 未知藥丸辨識 (Pill Identification)
-利用藥品外觀特徵資料庫，協助識別不明藥物，這對於急診室或居家用藥安全至關重要。
-- **特徵比對**：輸入特徵關鍵字（如「白色 圓形 YP」）。
-- **圖像輔助**：回傳可能的藥品清單與詳細外觀描述，協助使用者確認。
+可選 `include_cancelled` 以納入已註銷的許可證；`limit` 預設 3，上限 10。
 
-### 4. ATC 藥理分類查詢
-依 WHO ATC 代碼或藥理分類名稱搜尋相關藥品：
-- **ATC 代碼**：直接輸入 ATC 代碼（如 `A10BA02`）。
-- **分類名稱**：輸入藥理類別名稱（如「降血糖」）。
+### 2. 藥錠外觀辨識（`identify_unknown_pill`）
+以空白分隔的外觀關鍵字（顏色、形狀、刻痕、標記、尺寸、刻字）進行交集比對，協助辨識不明藥錠。英文顏色 / 形狀詞會以內建同義詞表擴展，例如 `"white round"` 或 `"白 圓形"`。
 
-### 5. 有效成分查詢
-依主成分名稱搜尋含有該成分的所有藥品：
-- **成分名稱**：支援中英文搜尋（如「Metformin」、「二甲雙胍」）。
+### 3. 藥品詳情（`get_drug_details`）
+回傳單一許可證的正規化（normalized）藥品紀錄，內容由儲存在 PostgreSQL 的正規化 JSON 組成，並附上目前各階段（stage）的可用性與文件數量。
 
-## 資料來源
-- **主要來源**：台灣 FDA 開放資料平台（Open Data），涵蓋 5 個端點：主資料、外觀、成分、ATC、仿單。
-- **資料庫**：PostgreSQL 16，`drug.*` schema（licenses / appearance / ingredients / atc / documents / sync_meta）。
-- **更新機制**：每週二 02:00 UTC 自動同步；啟動時若資料為空或過期（> 7 天）自動觸發。兩階段寫入：先抓取所有資料，再以單一 `TRUNCATE + INSERT` transaction 原子寫入，並對 `license_id` 去重防止 FDA 原始資料品質問題。
+### 4. 文件資產連結（`get_drug_asset_links`）
+回傳已持久化的資產 metadata，並即時產生 MinIO 的預簽（presigned）下載連結。資產群組（`asset_group`）包含 `insert`（電子仿單）、`label`（外盒標籤）、`shape`（外觀圖）、`analysis`（分析輸出）。
 
-## 應用場景
-1. **臨床決策支援**：醫師開立處方時的快速參考。
-2. **藥事服務**：藥師進行藥物諮詢與衛教的輔助工具。
-3. **民眾用藥安全**：協助一般民眾辨識藥物與了解副作用。
+## 資料管線（三階段）
+藥物資料以三個匯入階段建立，於 Admin Console 的藥物頁面觸發與監控（由 `admin-worker` 背景執行）：
+
+1. **`--drug-index`** — 從 TFDA 標準 `36_2.csv` 載入許可證索引，建立 `drug.licenses` 等基礎表。
+2. **`--drug-enrich`** — 爬取 TFDA 取得電子仿單、文件資產與藥錠外觀紀錄，並將檔案存入 MinIO。
+3. **`--drug-analysis`** — 對仿單文件執行 OCR（`DRUG_OCR_*`）與 LLM 分析（`DRUG_ANALYSIS_*`），萃取結構化內容寫入 `drug.insert_analysis`。
+
+`--drug` 等同於一次執行 index + enrich。
+
+## 技術架構
+- **資料來源**：台灣 FDA 西藥許可證（`mcp.fda.gov.tw`），透過 `DRUG_TFDA_BASE_URL` 設定。
+- **資料庫**：`drug` schema，含 `licenses`、`ingredients`、`atc`、`electronic_inserts`、`appearance_records`、`assets`、`insert_analysis`、`normalized_records` 等資料表，以及匯入狀態追蹤表（`import_runs`、`import_license_state`、`enrichment_queue` 等）。
+- **物件儲存**：仿單 / 標籤 / 外觀圖檔案存於 MinIO，工具回傳時即時產生有時效的預簽連結。
+- **嵌入搜尋**：藥品索引支援語意 / 混合搜尋（需 Ollama 嵌入服務）。
 
 ## 依賴關係
-本模組提供基礎藥品數據，並支援以下服務：
-- **FHIR Medication Service**：將台灣藥品資料轉換為 FHIR Medication 資源。
+- **FHIR Medication Service**：以本模組的藥品資料產生 FHIR Medication / MedicationKnowledge 資源。
+
+## 關鍵限制
+- 仿單 OCR + LLM 分析為機器產生，必須由臨床人員覆核。
+- `--drug-enrich` 與 `--drug-analysis` 需要可達的 TFDA / OCR / 分析 LLM 端點。

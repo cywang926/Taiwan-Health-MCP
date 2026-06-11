@@ -1,37 +1,23 @@
-# FHIR 用藥服務模組 (FHIR Medication Service)
+# FHIR Medication 服務模組 (FHIR Medication Service)
 
 ## 模組概述
-FHIR 用藥服務模組致力於將台灣 FDA 的藥品許可證資料，標準化為 FHIR R4 的 `Medication` 與 `MedicationKnowledge` 資源。此轉換確保了本地藥品資料能在符合國際標準的醫療資訊生態系中流通。
+FHIR Medication 服務模組將藥品服務模組的台灣 FDA 藥品資料，轉換為 FHIR R4 的 `Medication` 與 `MedicationKnowledge` 資源，並提供基本驗證。此模組讓藥品資料能以 FHIR 標準格式在系統間交換。
 
-## 核心功能
+## 主要功能
 
-### 1. 藥品資料標準化
-將台灣特有的藥品欄位轉換為 FHIR 標準欄位：
-- **識別碼**：將衛署/衛部藥字號作為主要的識別符 (`Identifier`)。
-- **藥品名稱**：整合中文名與英文名至 `code.text` 或 `code.coding.display`。
-- **劑型轉換**：將台灣劑型（如「膜衣錠」）映射至 FHIR 劑型代碼。
+### 1. 產生 FHIR Medication / MedicationKnowledge（`query_fhir_medication`）
+- 以藥品關鍵字（`keyword`）或許可證字號（`license_id`）查詢。
+- 以 `resource_type` 指定輸出 `Medication` 或 `MedicationKnowledge`。
+- 編碼採用 TFDA 許可證字號 CodeSystem（`https://mcp.fda.gov.tw/fhir/CodeSystem/tfda-license-id`），並帶入成分資訊。
 
-### 2. MedicationKnowledge 資源生成
-除了基本的用藥紀錄，本模組更著重於藥品本身的知識庫建構：
-- **適應症**：將藥品適應症描述轉換為結構化內容。
-- **成分列表**：詳細列出主成分 (`Ingredient`) 及其含量 (`Strength`)。
-- **包裝資訊**：描述藥品的包裝規格。
+### 2. 驗證 FHIR Medication（`validate_fhir_medication`）
+對傳入的 Medication JSON 進行基本結構驗證（必填欄位、編碼系統），回傳 `{"valid", "resource_type", "errors"}`。
 
-### 3. 用藥指導與安全資訊
-- **禁忌症**：標註藥品的禁忌狀況 (`Contraindication`)。
-- **管制級別**：標示是否為管制藥品（如第一級至第四級管制藥）。
+## 技術架構
+- **資料來源**：讀取藥品服務模組（`drug_service`）的正規化藥品資料。
+- **可用性**：本模組的可用性衍生自藥物域（`drug`）—藥品資料未載入時工具自動降級。
+- **驗證範圍**：僅基本結構與必填欄位驗證；完整 IG 一致性請改用 FHIR IG 模組的驗證工具或官方 HL7 FHIR Validator。
 
-## 技術細節
-
-### 支援的 FHIR 資源類型
-1. **Medication**：描述藥品本身的定義（成分、劑型）。
-2. **MedicationKnowledge**：描述藥品的詳細藥學特性與法規資訊（含 ATC 分類、適應症）。
-
-### 在地化挑戰與解決
-- **編碼系統**：台灣目前尚無全面導入 RxNorm，因此本系統使用官方 CodeSystem URI `https://data.fda.gov.tw/cfdatwn/license` 標識台灣藥證，ATC 代碼則使用 `http://www.whocc.no/atc`。
-- **中文相容性**：確保所有中文藥名與適應症在 JSON 序列化過程中正確編碼。
-
-## 應用場景
-1. **跨院處方箋**：在不同醫療機構間傳遞標準化的處方內容。
-2. **用藥安全檢查系統**：提供標準化的藥品屬性供 DSS (決策支援系統) 進行交互作用檢查。
-3. **藥品履歷追蹤**：記錄藥品從生產到開立的完整資訊鏈。
+## 依賴關係
+- **Drug Service**：提供來源藥品資料。
+- 與 **FHIR IG 模組** 互補：IG 模組提供剖面 / 術語層級的進階驗證與授權能力。

@@ -1,259 +1,122 @@
 # Taiwan Health MCP Server
 
-> 🇹🇼 台灣醫療健康資料整合 MCP 伺服器
-> 整合 ICD-10-CM、SNOMED CT、RxNorm、LOINC、FDA 藥品/保健食品/營養、TWCore IG、臨床指引，支援 FHIR R4 標準
+> 台灣醫療健康資料整合 MCP 伺服器
+> 整合 ICD-10-CM/PCS、SNOMED CT、LOINC、台灣 FDA 藥品 / 健康補充品 / 食品營養、臨床指引，以及 FHIR R4 IG 授權與驗證工具
 
 [![FHIR](https://img.shields.io/badge/FHIR-R4-blue)](http://hl7.org/fhir/R4/)
 [![Python](https://img.shields.io/badge/Python-3.12-green)](https://www.python.org/)
-[![MCP](https://img.shields.io/badge/MCP-1.0-orange)](https://modelcontextprotocol.io)
+[![MCP](https://img.shields.io/badge/MCP-1.25-orange)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
----
+以官方 **`mcp` SDK**（`mcp.server.fastmcp.FastMCP`）建構，對外提供約 **51 個工具**，涵蓋 12 個工具群組。專為高吞吐量的生產級 SaaS 部署設計。
 
-## ✨ 專案特色
+## 專案特色
 
-- 🇹🇼 **台灣在地化** — 整合台灣 FDA、衛福部官方開放資料，支援繁體中文
-- 🔗 **國際標準** — 符合 FHIR R4、ICD-10-CM 2025、LOINC 2.80、SNOMED CT、RxNorm、ATC
-- 🏥 **28 個 MCP 工具** — 由動態 registry 管理，涵蓋診斷、藥品、檢驗、指引、術語；RxNorm 能力已併入 `search_drug` modes
-- 🏗️ **生產就緒** — PostgreSQL 16 + pgBouncer + Redis + Prometheus，支援每秒數百請求
-- 🔄 **自動同步** — FDA 藥品/保健食品/營養資料每週自動更新
+- **台灣在地化資料**：台灣 FDA 藥品（含仿單 / 外觀 / OCR 分析）、健康補充品、食品營養、臨床指引、TWCore IG。
+- **國際術語支援**：ICD-10-CM/PCS 2025、SNOMED CT International、LOINC 2.80、FHIR R4。
+- **FHIR IG 授權工具**：多 IG（package-scoped）剖面 / ValueSet 查詢、術語驗證、骨架填值（skeleton-fill）資源產生與驗證。
+- **語意 / 混合搜尋**：以 Ollama 嵌入模型（`qwen3-embedding`）為基礎，無嵌入時自動退回關鍵字搜尋。
+- **動態工具啟用**：依各模組資料載入狀態自動註冊 / 移除可用 MCP 工具。
+- **管理後台**：可選的 Admin Console（上傳來源檔、執行 / 排程匯入、管理設定與外部 FHIR 伺服器、即時監控背景工作）。
+- **生產部署設計**：PostgreSQL 16（pgvector）、pgBouncer、Redis、MinIO、Prometheus、背景 worker。
 
----
-
-## 🚀 快速開始
-
-### 前置需求
-
-- Docker + Docker Compose
-- 至少 4 GB 可用記憶體
-
-### 1. 準備環境
+## 快速開始
 
 ```bash
-git clone https://github.com/healthymind-tech/Taiwan-Health-MCP.git
+git clone https://github.com/audi0417/Taiwan-Health-MCP.git
 cd Taiwan-Health-MCP
-cp .env.example .env
-cp config/datasets.example.yaml config/datasets.yaml
-# 編輯 .env，至少設定 POSTGRES_PASSWORD
-# 視部署環境編輯 config/datasets.yaml，指定各 dataset 的實際檔案位置
+cp .env.example .env                          # 設定 POSTGRES_PASSWORD、ADMIN_* 等
+docker compose up -d                          # postgres / pgbouncer / redis / minio / app / admin-worker
 ```
 
-### 2. 啟動服務
+## 載入資料（透過管理後台）
+
+資料匯入由 **Admin Console** 觸發、交由 `admin-worker` 背景執行（不再有獨立的 CLI data-loader 容器）。
+
+1. 在 `.env` 啟用管理後台：
+
+   ```dotenv
+   ADMIN_ENABLED=true
+   ADMIN_USERNAME=admin
+   # python -c "import hashlib; print('sha256$' + hashlib.sha256(b'change-me').hexdigest())"
+   ADMIN_PASSWORD_HASH=sha256$...
+   ADMIN_SESSION_SECRET=change_this_admin_session_secret
+   ```
+
+   重新啟動 `app`（`docker compose up -d`）後，於 `http://<host>:8000/admin` 登入。
+
+2. 在 **Modules** 頁籤依模組匯入資料：
+
+   - **需上傳來源檔**（在 Sources / Modules 上傳後按匯入）：ICD-10-CM/PCS、LOINC、SNOMED CT、FHIR IG（`package.tgz`）。
+   - **由 API 自動抓取**（直接按匯入或設定排程）：藥品（TFDA，三階段:索引 → 爬取豐富 → OCR/LLM 分析）、健康補充品、食品營養。
+   - **內建種子資料**（直接執行）：臨床指引。
+
+3. 嵌入（語意搜尋）會在各模組匯入後自動回填，也可於模組頁面單獨重建。
+
+匯入進度、步驟時間軸與即時日誌可在 **Tasks** 頁籤查看。詳見[管理後台文件](docs/admin/index.md)與[背景工作與排程](docs/admin/jobs-and-worker.md)。
+
+## 工具群組
+
+| 群組 | 工具 |
+|------|------|
+| ICD-10 | `search_medical_codes`、`infer_complications`、`get_nearby_codes`、`check_medical_conflict`、`browse_icd_category` |
+| 藥品 / TFDA | `search_drug`、`identify_unknown_pill`、`get_drug_details`、`get_drug_asset_links` |
+| 檢驗 / LOINC | `search_loinc`、`query_loinc`、`interpret_lab_result`、`batch_interpret_lab_results` |
+| 臨床指引 | `search_clinical_guideline`、`query_guideline` |
+| SNOMED CT | `search_snomed_concept`、`query_snomed_concept`、`get_snomed_relationships`、`query_snomed_mapping` |
+| FHIR Condition | `query_fhir_condition`、`validate_fhir_condition` |
+| FHIR Medication | `query_fhir_medication`、`validate_fhir_medication` |
+| FHIR IG（授權 / 驗證） | `fhir_list_igs`、`fhir_get_ig`、`fhir_list_artifacts`、`fhir_search_artifacts`、`fhir_list_resource_profiles`、`fhir_rank_resource_profiles`、`fhir_get_profile`、`fhir_get_profile_elements`、`fhir_get_valueset`、`fhir_expand_valueset`、`fhir_lookup_code`、`fhir_validate_code`、`fhir_normalize_code`、`fhir_resolve_reference`、`fhir_build_bundle`、`fhir_validate_resource`、`fhir_validate_bundle`、`fhir_get_resource_skeleton`、`fhir_finalize_resource` |
+| 健康補充品 | `search_health_supplements` |
+| 食品營養 | `query_food_nutrition`、`query_food_ingredient`、`search_foods_by_nutrient`、`analyze_meal_nutrition` |
+| FHIR 伺服器 | `list_fhir_servers`、`get_fhir_server_status`、`crud_fhir_server` |
+| 系統 | `health_check` |
+
+> 模組相關工具會依資料載入狀態自動啟用 / 停用；FHIR 伺服器與系統工具則永遠註冊。
+
+## 連接客戶端
+
+伺服器同時提供兩種介面,皆在同一個 `app` 容器、同一個埠(預設 8000):
+
+| 介面 | 端點 | 適用客戶端 |
+|------|------|-----------|
+| **MCP**（streamable-http） | `http://<host>:8000/mcp` | 原生 MCP 客戶端(Claude Desktop、Open WebUI v0.6.31+ 的 MCP 連線等) |
+| **OpenAPI bridge** | `GET http://<host>:8000/openapi.json`、`POST http://<host>:8000/tools/<工具名>` | 僅支援 OpenAPI 工具伺服器的客戶端(如 Open WebUI 的 External Tools / OpenAPI 類型) |
+
+- **MCP**:客戶端填 `http://<host>:8000/mcp`。
+- **OpenAPI**:`/openapi.json` 依「目前已啟用的工具」動態產生 OpenAPI 3.1 規格;每個工具對應 `POST /tools/<工具名>`,以 JSON body 當參數呼叫。客戶端只要填基底網址 `http://<host>:8000`,會自動抓 `/openapi.json`。
+
+> 例:在 **Open WebUI → Settings → Tools** 以 **OpenAPI** 類型新增工具伺服器,URL 填 `http://<host>:8000` 即可列出全部工具。
+>
+> 注意:這兩個介面目前皆**未強制驗證**(與既有設計一致);對外開放時請在前面加反向代理或 token。
+
+## 資料庫 Schema
+
+`audit` | `admin` | `icd` | `drug` | `health_supplements` | `food_nutrition` | `loinc` | `guideline` | `fhir`（multi-IG）| `snomed` | `rxnorm`
+
+完整定義見 `db/schema.sql`（PostgreSQL 容器首次啟動時自動套用），增量變更見 `db/migrations/`。
+
+## 管理後台（選用）
+
+預設停用。於 `.env` 設定 `ADMIN_ENABLED=true` 並提供 `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` / `ADMIN_SESSION_SECRET` 後，可於 `/admin` 存取 Admin Console，用於上傳來源檔、執行與排程資料匯入、管理設定與外部 FHIR 伺服器，以及監控由 `admin-worker` 執行的背景工作。詳見 `docs/admin/`。
+
+## 開發與測試
 
 ```bash
-docker compose up -d
+pip install -r requirements.txt
+pip install pytest pytest-asyncio
+python -m pytest tests/ -v
 ```
 
-這會啟動四個容器：`postgres`、`pgbouncer`、`redis`、`app`（MCP server）。
+## 文件
 
-### 3. 載入術語資料
+完整文件請見 [`docs/`](docs/) 與 MkDocs 設定（`mkdocs.yml`）。
 
-術語資料（ICD、LOINC、SNOMED CT 等）需手動下載後，在 `config/datasets.yaml`
-設定檔案位置，再執行 loader：
+## 致謝
 
-```bash
-# 全部載入（建議首次部署）
-docker compose --profile loader run --rm data-loader --all
-
-# 僅初始化 FDA 動態資料
-# 注意：Drug 匯入採 RxNorm-first 防呆，未先載入 RxNorm 會阻擋 --drug/--fda
-docker compose --profile loader run --rm data-loader --rxnorm
-docker compose --profile loader run --rm data-loader --fda
-docker compose --profile loader run --rm data-loader --drug
-docker compose --profile loader run --rm data-loader --health-food
-docker compose --profile loader run --rm data-loader --food-nutrition
-
-# 或依需求單項載入
-docker compose --profile loader run --rm data-loader --icd        # ICD-10-CM 2025
-docker compose --profile loader run --rm data-loader --loinc      # LOINC 2.80
-docker compose --profile loader run --rm data-loader --twcore     # TWCore IG
-docker compose --profile loader run --rm data-loader --guideline  # 臨床指引
-docker compose --profile loader run --rm data-loader --snomed     # SNOMED CT（5-15 分鐘）
-docker compose --profile loader run --rm data-loader --rxnorm     # RxNorm
-```
-
-`DATASETS_CONFIG` 預設為 `/app/config/datasets.yaml`。若未設定，loader 會回退到舊的
-`/app/fhir-code` 目錄規則。新部署建議使用 `config/datasets.yaml`，避免依賴固定檔名與固定目錄結構。
-
-> `--all` 現在也會初始化 Taiwan FDA 藥品、健康補充品、營養資料，且會自動處理相依順序（包含先載入 RxNorm）。
-> app 仍會在首次啟動或資料過期時自動同步；若想在部署階段先灌資料，建議使用 `data-loader --all`，或手動依序執行 `--rxnorm` 後再 `--fda`。
-
-### 4. 確認服務正常
-
-```bash
-# 查看服務狀態
-docker compose ps
-
-# 健康檢查（需先建立 MCP session）
-curl http://localhost:8000/mcp -X POST \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}'
-```
-
-### 升級既有資料庫（無資料遺失遷移）
-
-若您的環境是在 RxNorm 併入 `drug` schema 之前建立，請先執行一次 migration：
-
-```bash
-# 1. RxNorm 整併與 drug schema 補強
-docker compose exec -T postgres psql \
-  -U ${POSTGRES_USER:-mcp} \
-  -d ${POSTGRES_DB:-taiwan_health} \
-  -v ON_ERROR_STOP=1 \
-  < db/migrations/2026-04-12_drug_schema_no_loss.sql
-
-# 2. 移除已棄用的 embedding 資料表（drug.license_embeddings, drug.atc_embeddings）
-docker compose exec -T postgres psql \
-  -U ${POSTGRES_USER:-mcp} \
-  -d ${POSTGRES_DB:-taiwan_health} \
-  -v ON_ERROR_STOP=1 \
-  < db/migrations/2026-04-12_drop_unused_drug_embeddings.sql
-```
-
-> migration 1 會把不符合新約束的舊資料先備份到 `migration_backup.*`，再進行去重與約束補強。migration 2 移除從未被查詢的 embedding 資料表。
-
-### 5. 連接 Claude Desktop
-
-在 `claude_desktop_config.json` 加入：
-
-```json
-{
-  "mcpServers": {
-    "taiwan-health": {
-      "url": "http://localhost:8000/mcp",
-      "transport": "streamable-http"
-    }
-  }
-}
-```
-
----
-
-## 🏗️ 基礎架構
-
-| 元件 | 版本 | 用途 |
-|------|------|------|
-| PostgreSQL | 16-alpine | 主要資料庫（所有術語資料） |
-| pgBouncer | edoburu/latest | 連線池（transaction mode，500 client → 30 PG 連線） |
-| Redis | 7-alpine | 回應快取（TTL 策略，`@cached` 裝飾器） |
-| Prometheus | — | 指標監控（預設 port 9090） |
-| mcp SDK | 1.25 | 官方 MCP SDK（`mcp.server.fastmcp.FastMCP`） |
-| asyncpg | — | 高效能 PostgreSQL 非同步驅動 |
-
-### PostgreSQL Schema
-
-`audit` | `icd` | `drug` | `health_food` | `food_nutrition` | `loinc` | `guideline` | `twcore` | `snomed`
-
-> `drug` schema 內包含 FDA 藥品資料與 RxNorm 子表（`rx_concepts` / `rx_relationships` / `rx_atc_map`）。
-
----
-
-## 📋 核心功能（28 個 MCP 工具）
-
-工具分類、status page 範例與 dataset gating 由同一份 registry 產生；`tools/list` 只會顯示已載入資料集對應的工具，`health_check` 永遠可用。FHIR、TWCore 與臨床指引已合併成較少的對外入口。
-
-| 群組 | 工具數 | 功能 |
-|------|--------|------|
-| 系統 | 1 | `health_check`：資料庫、快取、資料集狀態一覽（永遠可用） |
-| ICD-10 | 5 | 診斷碼搜尋、併發症推論、鄰近碼、衝突檢查、分類瀏覽 |
-| 藥品 | 2 | `search_drug`（名稱 / ATC / 成分 / 許可證 / RxNorm 解析 / RXCUI 成分 / 交互作用）與外觀辨識 |
-| 健康補充品 | 1 | `search_health_supplement`：關鍵字、許可證、疾病情境推薦 |
-| 食品與營養 | 4 | `query_food_nutrition`（營養查詢 + 詳細面板）、`query_food_ingredient`（原料合規）、`search_foods_by_nutrient`（營養排序）、`analyze_meal_nutrition`（餐點分析） |
-| FHIR Condition | 2 | ICD-10 / 關鍵字 → FHIR R4 Condition，驗證 |
-| FHIR Medication | 2 | 藥品 / 關鍵字 → FHIR R4 Medication / MedicationKnowledge |
-| LOINC / Lab | 4 | `search_loinc` / `query_loinc` 入口 + 單項/批次判讀 |
-| 臨床指引 | 2 | 指引搜尋、分段內容、臨床路徑 |
-| TWCore IG | 1 | 台灣核心 CodeSystem 統一查詢入口 |
-| SNOMED CT | 4 | 概念搜尋、階層查詢、關聯查詢、ICD-10 雙向對應 |
-
----
-
-## 📦 資料集
-
-| 資料集 | 版本 | 授權 | 說明 |
-|--------|------|------|------|
-| ICD-10-CM | 2025 (NLM) | 公開 | 診斷碼 |
-| ICD-10-PCS | 2025 (CMS) | 公開 | 手術/處置碼（78,948 筆，`--icd` 同時載入） |
-| LOINC | 2.80 | LOINC License | 87,000+ 檢驗碼 |
-| SNOMED CT International | 20250601 | SNOMED License | 370,000+ 臨床概念、IS-A 階層 |
-| RxNorm | 2024-06-03 | 公開 (NLM) | 藥品命名、藥物交互作用 |
-| TWCore IG | v1.0.0 | 公開 (MOHW) | 30+ 台灣健保 CodeSystem |
-| Taiwan FDA 藥品 | 每週更新 | 公開 (FDA) | 66,000+ 藥品許可證 |
-| Taiwan FDA 健康補充品 | 每週更新 | 公開 (FDA) | 核可健康補充品 |
-| Taiwan FDA 營養 | 每週更新 | 公開 (FDA) | 食品營養成分資料庫 |
-| 臨床指引 | 自整理 | — | 台灣醫學會指引（種子資料） |
-
----
-
-## ⚠️ 重要限制
-
-- **健康補充品疾病對應** — 開發者整理，未經醫學驗證，不適合直接面向患者
-- **FHIR 驗證** — 僅檢查必要欄位；生產環境請使用 HL7 FHIR Validator
-- **ICD-10-PCS** — 已內建 2025 版（78,948 筆），`--icd` 自動同時載入 CM 和 PCS；`icd.procedures` 未載入時工具自動降級
-- **SNOMED CT** — 需有效的 SNOMED International 授權（多數用途免費）
-- **藥物交互作用** — RxNorm `interacts_with` 不含嚴重程度評級，須由臨床醫師確認
-- **pgBouncer transaction mode** — 不相容於 `LISTEN/NOTIFY` 和 named prepared statements（asyncpg 已設 `statement_cache_size=0`）
-
----
-
-## 🤝 貢獻
-
-歡迎貢獻！詳見 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-主要需求：
-- 補充/驗證臨床指引種子資料
-- 新增 LOINC 中文對照
-- 補充健康補充品疾病對應（需醫學審核）
-- 補充/驗證臨床指引種子資料
-
----
-
-## 📞 聯絡
-
-- **GitHub Issues**: [回報問題](https://github.com/healthymind-tech/Taiwan-Health-MCP/issues)
-- **Email**: [support@healthymind-tech.com](mailto:support@healthymind-tech.com)
-
----
-
-## 👥 Contributors
-
-<a href="https://github.com/healthymind-tech/Taiwan-Health-MCP/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=healthymind-tech/Taiwan-Health-MCP" />
-</a>
-
-Made with [contrib.rocks](https://contrib.rocks).
-
----
-
-## 🙏 致謝
-
-- 台灣衛生福利部、TFDA（ICD、藥品、健康補充品、營養資料）
+- 台灣衛生福利部、TFDA
 - Regenstrief Institute（LOINC）
-- SNOMED International（SNOMED CT）
-- National Library of Medicine（RxNorm、ICD-10-CM）
+- SNOMED International
+- National Library of Medicine（RxNorm / UMLS）
 - HL7 International（FHIR）
-- WHO（ICD、ATC）
-- Twinkle AI — 感謝社群串接本專案打造 Twinkle Health Agent
-
-**⭐ 如果這個專案對您有幫助，請給我們一個 Star！**
-## ⭐ Star History
-
-<picture>
-  <source
-    media="(prefers-color-scheme: dark)"
-    srcset="
-      https://api.star-history.com/svg?repos=healthymind-tech/Taiwan-Health-MCP&type=Date&theme=dark
-    "
-  />
-  <source
-    media="(prefers-color-scheme: light)"
-    srcset="
-      https://api.star-history.com/svg?repos=healthymind-tech/Taiwan-Health-MCP&type=Date
-    "
-  />
-  <img
-    alt="Star History Chart"
-    src="https://api.star-history.com/svg?repos=healthymind-tech/Taiwan-Health-MCP&type=Date"
-  />
-</picture>
+- WHO

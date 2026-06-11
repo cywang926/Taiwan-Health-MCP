@@ -1,31 +1,127 @@
 import asyncio
 import inspect
 import json
+import mimetypes
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
+from urllib.parse import parse_qs
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import TextContent, ToolAnnotations
 
+import admin_maintenance
 import audit
 import cache as cache_module
 import database
+import db_health
+import fhir_reference
 import metrics
+from admin_console import (
+    SESSION_COOKIE_NAME,
+    AdminOverviewPayload,
+    build_admin_login_html,
+    build_admin_session_cookie,
+    build_admin_session_token,
+    clear_admin_session_cookie,
+    parse_admin_session_token,
+    verify_admin_password,
+)
+from admin_drug import (
+    get_drug_admin_status,
+    get_drug_license_events,
+    get_drug_pipeline_status,
+)
+from admin_embedding import get_embedding_status
+from admin_jobs import (
+    ADMIN_JOB_TYPES,
+)
+from admin_jobs import create_job as create_admin_job
+from admin_jobs import get_job as get_admin_job
+from admin_jobs import (
+    list_job_logs,
+    list_job_steps,
+)
+from admin_jobs import list_jobs as list_admin_jobs
+from admin_jobs import (
+    list_worker_heartbeats,
+    request_job_control,
+    summarize_jobs,
+)
+from admin_preview import PREVIEW_SUPPORTED_MODULES, dispatch_preview
+from admin_schedule import (
+    SCHEDULABLE_MODULES,
+    URL_FETCH_MODULES,
+    delete_schedule,
+    ensure_default_schedules,
+    ensure_schedule_table,
+    fire_schedule,
+    get_schedule,
+    upsert_schedule,
+)
+from admin_services import list_service_probes, run_service_probes
+from admin_sources import (
+    activate_source,
+    catalog_entry,
+    clear_drug_module,
+    clear_icd_module,
+    clear_ig_module,
+    clear_loinc_module,
+    clear_rxnorm_module,
+    clear_snomed_module,
+    create_uploaded_source,
+    deactivate_source,
+    delete_uploaded_source,
+    ensure_ig_artifact_tables,
+    ensure_version_num_column,
+    list_source_catalog,
+    list_source_versions,
+    validate_source_content,
+    validate_source_filename,
+)
+from admin_ws import broadcast as ws_broadcast
+from admin_ws import (
+    handle_admin_websocket,
+    init_broadcast,
+    start_ws_relay,
+)
 from audit import audited
 from clinical_guideline_service import ClinicalGuidelineService
 from config import AppConfig
-from dataset_status import DatasetStatusManager
-from drug_interaction_service import DrugInteractionService
 from drug_service import DrugService
 from embedding_service import EmbeddingService
 from fhir_condition_service import FHIRConditionService
+from fhir_ig_service import FHIRIGService
 from fhir_medication_service import FHIRMedicationService
+from fhir_server_service import (
+    create_fhir_server,
+    delete_fhir_server,
+    discover_fhir_metadata,
+    ensure_fhir_server_schema,
+    export_fhir_servers,
+    fhir_server_secret_key,
+    generate_client_key,
+    get_fhir_server,
+    get_fhir_server_jwks,
+)
+from fhir_server_service import list_fhir_servers as list_registered_fhir_servers
+from fhir_server_service import (
+    perform_fhir_crud,
+    probe_fhir_server,
+    server_mcp_summary,
+    set_default_fhir_server,
+    test_fhir_server_config,
+    update_fhir_server,
+)
 from food_nutrition_service import FoodNutritionService
-from health_food_service import HealthFoodService
+from health_supplements_service import HealthSupplementsService
 from icd_service import ICDService
 from lab_service import LabService
+from minio_service import MinioConfig, MinioService
+from module_status import CACHE_TTL, SERVICE_MODULES, ModuleStatusManager
 from snomed_service import SNOMEDService
 from twcore_service import TWCoreService
 from utils import configure_log_level, log_error, log_info, log_warning
@@ -36,15 +132,16 @@ configure_log_level(config.log_level)
 # Services (populated once on first lifespan run)
 icd_service: ICDService | None = None
 drug_service: DrugService | None = None
-health_food_service: HealthFoodService | None = None
+minio_service: MinioService | None = None
+health_supplements_service: HealthSupplementsService | None = None
 food_nutrition_service: FoodNutritionService | None = None
 fhir_condition_service: FHIRConditionService | None = None
 fhir_medication_service: FHIRMedicationService | None = None
 lab_service: LabService | None = None
 guideline_service: ClinicalGuidelineService | None = None
 twcore_service: TWCoreService | None = None
+fhir_ig_service: FHIRIGService | None = None
 snomed_service: SNOMEDService | None = None
-drug_interaction_service: DrugInteractionService | None = None
 
 # FastMCP (streamable-http mode) runs the lifespan once per session, not per
 # process.  Guard all one-time initialization behind a lock + flag so that
@@ -52,103 +149,184 @@ drug_interaction_service: DrugInteractionService | None = None
 _init_lock: asyncio.Lock | None = None  # created lazily inside async context
 _initialized: bool = False
 _db_stats_task: asyncio.Task | None = None
-_dataset_status = DatasetStatusManager()
+# Long-lived Redis pub/sub relay task (started once; cancelled at process
+# shutdown so the event loop tears down without "Task was destroyed but it is
+# pending" / async-generator finalisation noise from pubsub.listen()).
+_ws_relay_task: asyncio.Task | None = None
+_module_status = ModuleStatusManager()
+_server_started_at = datetime.now(timezone.utc)
 
 
-@asynccontextmanager
-async def lifespan(server):
-    global icd_service, drug_service, health_food_service, food_nutrition_service
+async def _initialize_shared_resources() -> None:
+    global icd_service, drug_service, minio_service, health_supplements_service, food_nutrition_service
     global fhir_condition_service, fhir_medication_service, lab_service, guideline_service, twcore_service
-    global snomed_service, drug_interaction_service
-    global _init_lock, _initialized, _db_stats_task
+    global fhir_ig_service
+    global snomed_service
+    global _init_lock, _initialized, _db_stats_task, _ws_relay_task
 
-    # Lazily create the lock (must happen inside the running event loop)
     if _init_lock is None:
         _init_lock = asyncio.Lock()
 
     async with _init_lock:
-        if not _initialized:
-            log_info(f"Starting Taiwan Health MCP — {config}")
+        if _initialized:
+            return
 
-            # ── Prometheus metrics server ─────────────────────────────────
-            if config.transport != "stdio":
-                metrics.start_metrics_server()
+        log_info(f"Starting Taiwan Health MCP — {config}")
 
-            # ── Infrastructure ────────────────────────────────────────────
-            # statement_cache_size=0 required for pgBouncer transaction-mode
-            pool = await database.init_pool(
-                config.database_url, min_size=5, max_size=20, statement_cache_size=0
-            )
-            await cache_module.init_client(config.redis_url)
+        if config.transport != "stdio":
+            metrics.start_metrics_server()
 
-            # ── Start DB pool stats collector ─────────────────────────────
-            _db_stats_task = await metrics.start_db_stats_collector(database.get_pool)
+        await database.init_pool(
+            config.database_url, min_size=5, max_size=20, statement_cache_size=0
+        )
+        # Use the reset-safe handle (not the raw pool) for everything below: the
+        # services capture this, so a reset_pool() swap after a DB restart cannot
+        # strand them on a terminated pool ("pool is closed"). See database.py.
+        pool = database.pool_handle()
+        await cache_module.init_client(config.redis_url)
 
-            # ── Embedding (semantic search) ───────────────────────────────
-            embedding_svc = EmbeddingService()
-            await embedding_svc.initialize()
+        # Start the DB health monitor — gates operations while the DB is down.
+        await db_health.monitor().start()
 
-            # ── Services ──────────────────────────────────────────────────
-            for name, factory in [
-                ("ICDService", lambda: ICDService(pool, embedding_svc)),
-                ("DrugService", lambda: DrugService(pool, embedding_svc)),
-                ("HealthFoodService", lambda: HealthFoodService(pool, embedding_svc)),
-                (
-                    "FoodNutritionService",
-                    lambda: FoodNutritionService(pool, embedding_svc),
-                ),
-                ("FHIRConditionService", lambda: FHIRConditionService(pool)),
-                ("FHIRMedicationService", lambda: FHIRMedicationService(drug_service)),
-                ("LabService", lambda: LabService(pool, embedding_svc)),
-                (
-                    "ClinicalGuidelineService",
-                    lambda: ClinicalGuidelineService(pool, embedding_svc),
-                ),
-                ("TWCoreService", lambda: TWCoreService(pool)),
-                ("SNOMEDService", lambda: SNOMEDService(pool, embedding_svc)),
-                ("DrugInteractionService", lambda: DrugInteractionService(pool)),
-            ]:
-                try:
-                    svc = factory()
-                    await svc.initialize()
-                    if name == "ICDService":
-                        icd_service = svc
-                    elif name == "DrugService":
-                        drug_service = svc
-                    elif name == "HealthFoodService":
-                        health_food_service = svc
-                    elif name == "FoodNutritionService":
-                        food_nutrition_service = svc
-                    elif name == "FHIRConditionService":
-                        fhir_condition_service = svc
-                    elif name == "FHIRMedicationService":
-                        fhir_medication_service = svc
-                    elif name == "LabService":
-                        lab_service = svc
-                    elif name == "ClinicalGuidelineService":
-                        guideline_service = svc
-                    elif name == "TWCoreService":
-                        twcore_service = svc
-                    elif name == "SNOMEDService":
-                        snomed_service = svc
-                    elif name == "DrugInteractionService":
-                        drug_interaction_service = svc
-                except Exception as e:
-                    log_error(f"{name} failed to initialize", error=str(e))
+        # Apply idempotent schema migrations for admin tables.
+        await ensure_version_num_column(pool)
+        await ensure_ig_artifact_tables(pool)
+        await ensure_schedule_table(pool)
+        await ensure_default_schedules(pool)
+        await ensure_fhir_server_schema(pool)
 
-            # ── Redis warm-up ─────────────────────────────────────────────
-            await _warm_up_cache()
+        # Seed DB-backed settings from .env on first boot (no-op if already seeded),
+        # then apply embedding settings to the query-time embedding client.
+        import admin_settings
+        import embedding_service as _embedding_service
 
-            # ── Initial tool registration based on available datasets ────────
-            await _dataset_status.refresh_if_stale_and_sync(pool, SERVICE_TOOLS, mcp)
+        await admin_settings.seed_if_empty(pool)
+        _embedding_service.configure(await admin_settings.get_group(pool, "embedding"))
 
-            _initialized = True
-            log_info("All services initialized — server ready")
+        # Wire up the WebSocket broadcaster and start the cross-process relay.
+        # init_broadcast() tells broadcast() which Redis URL to publish to.
+        # start_ws_relay() subscribes and fans out to connected browser tabs.
+        init_broadcast(config.redis_url)
+        # Keep a reference so the task is not GC'd while pending and can be
+        # cancelled cleanly at process shutdown (see _shutdown_ws_relay).
+        _ws_relay_task = asyncio.create_task(start_ws_relay(config.redis_url))
+
+        minio_service = MinioService(
+            MinioConfig.from_values(await admin_settings.get_group(pool, "minio"))
+        )
+        await minio_service.initialize()
+
+        _db_stats_task = await metrics.start_db_stats_collector(database.get_pool)
+
+        embedding_svc = EmbeddingService()
+        await embedding_svc.initialize()
+
+        for name, factory in [
+            ("ICDService", lambda: ICDService(pool, embedding_svc)),
+            ("DrugService", lambda: DrugService(pool, minio_service=minio_service)),
+            (
+                "HealthSupplementsService",
+                lambda: HealthSupplementsService(pool, embedding_svc),
+            ),
+            (
+                "FoodNutritionService",
+                lambda: FoodNutritionService(pool, embedding_svc),
+            ),
+            ("FHIRConditionService", lambda: FHIRConditionService(pool)),
+            ("FHIRMedicationService", lambda: FHIRMedicationService(pool)),
+            ("LabService", lambda: LabService(pool, embedding_svc)),
+            (
+                "ClinicalGuidelineService",
+                lambda: ClinicalGuidelineService(pool, embedding_svc),
+            ),
+            ("TWCoreService", lambda: TWCoreService(pool)),
+            ("FHIRIGService", lambda: FHIRIGService(pool, embedding_svc)),
+            ("SNOMEDService", lambda: SNOMEDService(pool, embedding_svc)),
+        ]:
+            try:
+                svc = factory()
+                await svc.initialize()
+                if name == "ICDService":
+                    icd_service = svc
+                elif name == "DrugService":
+                    drug_service = svc
+                elif name == "HealthSupplementsService":
+                    health_supplements_service = svc
+                elif name == "FoodNutritionService":
+                    food_nutrition_service = svc
+                elif name == "FHIRConditionService":
+                    fhir_condition_service = svc
+                elif name == "FHIRMedicationService":
+                    fhir_medication_service = svc
+                elif name == "LabService":
+                    lab_service = svc
+                elif name == "ClinicalGuidelineService":
+                    guideline_service = svc
+                elif name == "TWCoreService":
+                    twcore_service = svc
+                elif name == "FHIRIGService":
+                    fhir_ig_service = svc
+                elif name == "SNOMEDService":
+                    snomed_service = svc
+            except Exception as e:
+                log_error(f"{name} failed to initialize", error=str(e))
+
+        await _warm_up_cache()
+        await _module_status.refresh_if_stale_and_sync(
+            pool,
+            SERVICE_TOOLS,
+            mcp,
+            force=True,
+        )
+
+        _initialized = True
+        log_info("All services initialized — server ready")
+
+
+async def _ensure_runtime_ready() -> None:
+    if _initialized:
+        return
+    try:
+        database.get_pool()
+        return
+    except RuntimeError:
+        pass
+    await _initialize_shared_resources()
+
+
+@asynccontextmanager
+async def lifespan(server):
+    await _initialize_shared_resources()
 
     yield
 
     # Session teardown — do NOT close shared resources; the process may still
     # be serving other sessions.  Resources are reclaimed when the process exits.
+
+
+async def _shutdown_ws_relay() -> None:
+    """Cancel the long-lived Redis pub/sub relay task at process shutdown.
+
+    Driven from the ASGI ``lifespan.shutdown`` event (see PrivacyPageMiddleware),
+    which fires once per process — unlike FastMCP's per-session ``lifespan`` — so
+    this is the right place to reclaim a process-scoped task.  Without it the
+    event loop closes while ``start_ws_relay`` is still parked inside
+    ``pubsub.listen()``, producing "Task was destroyed but it is pending" plus an
+    async-generator finalisation race.  Cancelling injects ``CancelledError`` at
+    the await point so the generator and its Redis connection close cleanly.
+    No-op when the relay was never started (e.g. no session ran)."""
+    global _ws_relay_task
+    task = _ws_relay_task
+    _ws_relay_task = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # defensive — shutdown must not raise
+        pass
 
 
 async def _warm_up_cache() -> None:
@@ -181,10 +359,149 @@ def _svc_unavailable(name: str) -> str:
     return json.dumps(
         {
             "error": f"{name} service is not available",
-            "hint": "Run the data-loader to populate this dataset, then restart the server.",
+            "hint": "Run the data-loader to populate this module, then restart the server.",
         },
         ensure_ascii=False,
     )
+
+
+def _svc_maintenance(name: str) -> str:
+    """Return a standard JSON response when a service is in maintenance mode.
+
+    Unlike _svc_unavailable (module never loaded), this signals a deliberate,
+    temporary pause initiated by an admin; clients should retry later.
+    """
+    return json.dumps(
+        {
+            "error": f"{name} is temporarily under maintenance",
+            "status": "maintenance",
+            "hint": "The module is being updated by an administrator. Please retry shortly.",
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _icd_maintenance_active() -> bool:
+    """True if ICD is in maintenance mode. Fail-open: if the flag can't be read
+    (e.g. pool not ready) we do NOT pause the service, to avoid an outage on a
+    transient settings-read error."""
+    try:
+        return await admin_maintenance.is_enabled(database.get_pool(), "icd")
+    except Exception:
+        return False
+
+
+async def _loinc_maintenance_active() -> bool:
+    """True if LOINC is in maintenance mode. Fail-open on settings read errors."""
+    try:
+        return await admin_maintenance.is_enabled(database.get_pool(), "loinc")
+    except Exception:
+        return False
+
+
+async def _snomed_maintenance_active() -> bool:
+    """True if SNOMED CT is in maintenance mode. Fail-open on settings read errors."""
+    try:
+        return await admin_maintenance.is_enabled(database.get_pool(), "snomed")
+    except Exception:
+        return False
+
+
+async def _ig_maintenance_active() -> bool:
+    """True if the Implementation Guides module is in maintenance mode. Fail-open on
+    settings read errors."""
+    try:
+        return await admin_maintenance.is_enabled(database.get_pool(), "ig")
+    except Exception:
+        return False
+
+
+async def _drug_maintenance_active() -> bool:
+    """True if Drug is in maintenance mode. Fail-open on settings read errors."""
+    try:
+        return await admin_maintenance.is_enabled(database.get_pool(), "drug")
+    except Exception:
+        return False
+
+
+async def _module_record_counts(pool) -> dict[str, int]:
+    """Row counts used by the admin UI to tell EMPTY from POPULATED.
+
+    Upload-based modules use this for maintenance/import state. Action-only
+    modules use it to disable preview/embed until a sync or seed has created
+    source rows.
+    """
+    counts: dict[str, int] = {}
+    try:
+        async with pool.acquire() as conn:
+            diag = await conn.fetchval("SELECT COUNT(*) FROM icd.diagnoses")
+            proc = await conn.fetchval("SELECT COUNT(*) FROM icd.procedures")
+        counts["icd"] = int(diag or 0) + int(proc or 0)
+    except Exception:
+        counts["icd"] = 0
+    try:
+        async with pool.acquire() as conn:
+            loinc = await conn.fetchval("SELECT COUNT(*) FROM loinc.concepts")
+        counts["loinc"] = int(loinc or 0)
+    except Exception:
+        counts["loinc"] = 0
+    try:
+        async with pool.acquire() as conn:
+            snomed = await conn.fetchval("SELECT COUNT(*) FROM snomed.concepts")
+        counts["snomed"] = int(snomed or 0)
+    except Exception:
+        counts["snomed"] = 0
+    try:
+        async with pool.acquire() as conn:
+            rxnorm = await conn.fetchval("SELECT COUNT(*) FROM rxnorm.concepts")
+        counts["rxnorm"] = int(rxnorm or 0)
+    except Exception:
+        counts["rxnorm"] = 0
+    try:
+        async with pool.acquire() as conn:
+            ig_count = await conn.fetchval("""
+                SELECT
+                    (SELECT COUNT(*) FROM fhir.codesystems)
+                  + (SELECT COUNT(*) FROM fhir.artifacts)
+                """)
+        counts["ig"] = int(ig_count or 0)
+    except Exception:
+        counts["ig"] = 0
+    try:
+        async with pool.acquire() as conn:
+            drug = await conn.fetchval(
+                "SELECT COUNT(*) FROM drug.licenses WHERE is_listed"
+            )
+        counts["drug"] = int(drug or 0)
+    except Exception:
+        counts["drug"] = 0
+    try:
+        async with pool.acquire() as conn:
+            guideline = await conn.fetchval(
+                "SELECT COUNT(*) FROM guideline.disease_guidelines"
+            )
+        counts["guideline"] = int(guideline or 0)
+    except Exception:
+        counts["guideline"] = 0
+    try:
+        async with pool.acquire() as conn:
+            health_supplements = await conn.fetchval(
+                "SELECT COUNT(*) FROM health_supplements.items"
+            )
+        counts["health_supplements"] = int(health_supplements or 0)
+    except Exception:
+        counts["health_supplements"] = 0
+    try:
+        async with pool.acquire() as conn:
+            food_nutrition = await conn.fetchval("""
+                SELECT
+                    (SELECT COUNT(DISTINCT sample_name) FROM food_nutrition.measurements)
+                  + (SELECT COUNT(*) FROM food_nutrition.ingredients)
+                """)
+        counts["food_nutrition"] = int(food_nutrition or 0)
+    except Exception:
+        counts["food_nutrition"] = 0
+    return counts
 
 
 def _json_error(message: str, **extra) -> str:
@@ -206,237 +523,439 @@ async def _call_service_json(service, method_name: str, *args, **kwargs) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-def _empty_drug_result_item() -> dict:
-    """Return the canonical result item shape for all search_drug modes."""
+def _admin_enabled() -> bool:
+    return config.admin_enabled
+
+
+def _admin_ready() -> bool:
+    return config.admin_ready
+
+
+def _format_uptime() -> str:
+    elapsed = datetime.now(timezone.utc) - _server_started_at
+    total_seconds = int(elapsed.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _parse_cookie_header(scope: dict[str, Any]) -> dict[str, str]:
+    cookie = SimpleCookie()
+    for name, value in scope.get("headers", []):
+        if name.lower() == b"cookie":
+            try:
+                cookie.load(value.decode("latin-1"))
+            except Exception:
+                return {}
+    return {key: morsel.value for key, morsel in cookie.items()}
+
+
+def _parse_query_params(scope: dict[str, Any]) -> dict[str, str]:
+    raw = scope.get("query_string", b"")
+    if not raw:
+        return {}
+    parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+    return {key: values[0] if values else "" for key, values in parsed.items()}
+
+
+def _header_value(scope: dict[str, Any], name: str) -> str:
+    target = name.lower().encode("latin-1")
+    for key, value in scope.get("headers", []):
+        if key.lower() == target:
+            return value.decode("latin-1", errors="replace")
+    return ""
+
+
+def _admin_username_from_scope(scope: dict[str, Any]) -> str | None:
+    if not _admin_ready():
+        return None
+    cookies = _parse_cookie_header(scope)
+    token = cookies.get(SESSION_COOKIE_NAME)
+    return parse_admin_session_token(token, config.admin_session_secret)
+
+
+def _admin_service_registry() -> dict[str, bool]:
     return {
-        "license_id": None,
-        "name_zh": None,
-        "name_en": None,
-        "indication": None,
-        "usage": None,
-        "form": None,
-        "package": None,
-        "category": None,
-        "manufacturer": None,
-        "valid_date": None,
-        "ingredients": [],
-        "appearance": {},
-        "atc": [],
-        "rxnorm": [],
-        "insert_url": None,
+        "icd": icd_service is not None,
+        "drug": drug_service is not None,
+        "health_supplements": health_supplements_service is not None,
+        "food_nutrition": food_nutrition_service is not None,
+        "fhir_condition": fhir_condition_service is not None,
+        "fhir_medication": fhir_medication_service is not None,
+        "lab": lab_service is not None,
+        "guideline": guideline_service is not None,
+        "ig": fhir_ig_service is not None,
+        "snomed": snomed_service is not None,
     }
 
 
-def _normalize_atc_entries(entries: object) -> list[dict]:
-    """Normalize ATC rows to [{atc_code, atc_name}]."""
-    if not isinstance(entries, list):
-        return []
-    normalized: list[dict] = []
-    seen: set[str] = set()
-    for row in entries:
-        if not isinstance(row, dict):
+async def _read_json_body(receive) -> dict[str, Any]:
+    chunks: list[bytes] = []
+    more_body = True
+    while more_body:
+        message = await receive()
+        if message["type"] != "http.request":
             continue
-        code = row.get("atc_code") or row.get("code")
-        name = row.get("atc_name") or row.get("name")
-        if not code and not name:
-            continue
-        key = f"{code or ''}|{name or ''}"
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append({"atc_code": code, "atc_name": name})
-    return normalized
-
-
-def _normalize_rxnorm_entries(entries: object) -> list[dict]:
-    """Normalize RxNorm rows to [{rxcui, name, tty, atc_code}]."""
-    if not isinstance(entries, list):
-        return []
-    normalized: list[dict] = []
-    seen: set[str] = set()
-    for row in entries:
-        if not isinstance(row, dict):
-            continue
-        rxcui = row.get("rxcui")
-        if not rxcui:
-            continue
-        name = row.get("name")
-        tty = row.get("tty")
-        atc_code = row.get("atc_code")
-        key = f"{rxcui}|{atc_code or ''}"
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(
-            {"rxcui": str(rxcui), "name": name, "tty": tty, "atc_code": atc_code}
-        )
-    return normalized
-
-
-def _normalize_ingredient_entries(entries: object) -> list[dict]:
-    """Normalize ingredient rows to a shared shape for all search_drug modes."""
-    if not isinstance(entries, list):
-        return []
-    normalized: list[dict] = []
-    for row in entries:
-        if not isinstance(row, dict):
-            continue
-        name = row.get("ingredient_name") or row.get("name")
-        qty = row.get("ingredient_qty")
-        unit = row.get("ingredient_unit")
-        rxcui = row.get("rxcui")
-        tty = row.get("tty")
-        if not any([name, qty, unit, rxcui, tty]):
-            continue
-        normalized.append(
-            {
-                "ingredient_name": name,
-                "ingredient_qty": qty,
-                "ingredient_unit": unit,
-                "rxcui": str(rxcui) if rxcui else None,
-                "tty": tty,
-            }
-        )
-    return normalized
-
-
-async def _load_rxnorm_by_atc_codes(atc_codes: list[str]) -> dict[str, list[dict]]:
-    """Map ATC code -> RxNorm concept candidates."""
-    codes = sorted({c.strip().upper() for c in atc_codes if isinstance(c, str) and c.strip()})
-    if not codes:
+        body = message.get("body", b"")
+        if body:
+            chunks.append(body)
+        more_body = bool(message.get("more_body", False))
+    if not chunks:
         return {}
+    return json.loads(b"".join(chunks).decode("utf-8"))
+
+
+async def _refresh_settings_singletons(pool, group: str) -> None:
+    """After a settings save, hot-apply changes to long-lived app singletons so
+    no restart is needed (the worker picks up DB changes on its own via the
+    short-TTL settings cache)."""
+    global minio_service
+    import admin_settings
+
+    try:
+        if group == "embedding":
+            import embedding_service as _es
+
+            _es.configure(await admin_settings.get_group(pool, "embedding"))
+        elif group == "minio":
+            new_svc = MinioService(
+                MinioConfig.from_values(await admin_settings.get_group(pool, "minio"))
+            )
+            await new_svc.initialize()
+            minio_service = new_svc
+            if drug_service is not None:
+                drug_service._minio_service = new_svc
+    except Exception as exc:
+        log_warning("Settings singleton refresh failed", group=group, error=str(exc))
+
+
+async def _build_admin_overview_payload() -> AdminOverviewPayload:
+    generated_at = datetime.now(timezone.utc).isoformat()
+    infrastructure: dict[str, dict[str, Any]] = {}
+    modules: dict[str, dict[str, Any]] = {}
+    services: dict[str, dict[str, Any]] = {}
+    jobs: dict[str, Any] = {
+        "queued": 0,
+        "running": 0,
+        "success": 0,
+        "failed": 0,
+        "paused": 0,
+        "stopped": 0,
+    }
+    workers: list[dict[str, Any]] = []
+
+    db_ok = False
+    redis_ok = False
+    pool = None
+
     try:
         pool = database.get_pool()
-    except RuntimeError:
-        return {}
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT m.atc_code, m.rxcui, c.name, c.tty
-            FROM drug.rx_atc_map m
-            LEFT JOIN drug.rx_concepts c ON c.rxcui = m.rxcui
-            WHERE UPPER(m.atc_code) = ANY($1::text[])
-            ORDER BY m.atc_code, m.rxcui
-            """,
-            codes,
-        )
-    by_code: dict[str, list[dict]] = {}
-    for row in rows:
-        code = (row["atc_code"] or "").upper()
-        by_code.setdefault(code, []).append(
-            {
-                "rxcui": row["rxcui"],
-                "name": row["name"],
-                "tty": row["tty"],
-                "atc_code": row["atc_code"],
-            }
-        )
-    return by_code
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        db_ok = True
+        infrastructure["database"] = {
+            "status": "ok",
+            "detail": "PostgreSQL reachable",
+        }
+    except Exception as exc:
+        infrastructure["database"] = {
+            "status": "error",
+            "detail": str(exc),
+        }
 
-
-async def _load_atc_by_rxcuis(rxcuis: list[str]) -> dict[str, list[dict]]:
-    """Map RXCUI -> ATC rows."""
-    keys = sorted({str(r).strip() for r in rxcuis if str(r).strip()})
-    if not keys:
-        return {}
     try:
-        pool = database.get_pool()
-    except RuntimeError:
-        return {}
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT rxcui, atc_code, atc_name
-            FROM drug.rx_atc_map
-            WHERE rxcui = ANY($1::text[])
-            ORDER BY rxcui, atc_code
-            """,
-            keys,
-        )
-    by_rxcui: dict[str, list[dict]] = {}
-    for row in rows:
-        by_rxcui.setdefault(row["rxcui"], []).append(
-            {"atc_code": row["atc_code"], "atc_name": row["atc_name"]}
-        )
-    return by_rxcui
+        client = cache_module.get_client()
+        await client.ping()
+        redis_ok = True
+        infrastructure["redis"] = {
+            "status": "ok",
+            "detail": "Redis reachable",
+        }
+    except Exception as exc:
+        infrastructure["redis"] = {
+            "status": "error",
+            "detail": str(exc),
+        }
 
-
-async def _normalize_drug_result_items(items: list[dict]) -> list[dict]:
-    """Canonicalize result items and enrich FDA items with rxnorm mappings by ATC."""
-    atc_codes: list[str] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        atc_rows = _normalize_atc_entries(item.get("atc"))
-        atc_codes.extend(
-            [row["atc_code"] for row in atc_rows if isinstance(row.get("atc_code"), str)]
-        )
-    rxnorm_by_atc = await _load_rxnorm_by_atc_codes(atc_codes)
-
-    normalized: list[dict] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        out = _empty_drug_result_item()
-        for key in (
-            "license_id",
-            "name_zh",
-            "name_en",
-            "indication",
-            "usage",
-            "form",
-            "package",
-            "category",
-            "manufacturer",
-            "valid_date",
-            "insert_url",
-        ):
-            out[key] = item.get(key)
-
-        out["ingredients"] = _normalize_ingredient_entries(item.get("ingredients"))
-        out["appearance"] = item.get("appearance") if isinstance(item.get("appearance"), dict) else {}
-        out["atc"] = _normalize_atc_entries(item.get("atc"))
-
-        merged_rxnorm = _normalize_rxnorm_entries(item.get("rxnorm"))
-        for atc_row in out["atc"]:
-            code = (atc_row.get("atc_code") or "").upper()
-            merged_rxnorm.extend(rxnorm_by_atc.get(code, []))
-        out["rxnorm"] = _normalize_rxnorm_entries(merged_rxnorm)
-        normalized.append(out)
-    return normalized
-
-
-async def _normalize_drug_mode_payload(raw_payload: object, mode: str, keyword: str) -> str:
-    """Normalize FDA-backed mode payloads to the canonical result shape."""
-    payload: object = raw_payload
-    if isinstance(raw_payload, str):
-        try:
-            payload = json.loads(raw_payload)
-        except json.JSONDecodeError:
-            return raw_payload
-    if not isinstance(payload, dict):
-        return json.dumps(payload, ensure_ascii=False)
-
-    payload["mode"] = mode
-    payload["keyword"] = keyword
-    results = payload.get("results")
-    if isinstance(results, list):
-        payload["results"] = await _normalize_drug_result_items(results)
+    if minio_service is None:
+        infrastructure["minio"] = {
+            "status": "error",
+            "detail": "MinIO service not initialized",
+        }
+    elif minio_service.enabled:
+        infrastructure["minio"] = {
+            "status": "ok",
+            "detail": f"Bucket: {minio_service.config.bucket}",
+        }
+    elif minio_service.config.enabled:
+        infrastructure["minio"] = {
+            "status": "degraded",
+            "detail": minio_service.init_error or "MinIO configured but unavailable",
+        }
     else:
-        payload["results"] = []
-    return json.dumps(payload, ensure_ascii=False)
+        infrastructure["minio"] = {
+            "status": "degraded",
+            "detail": "MinIO disabled by configuration",
+        }
+
+    # OCR server — external ML dependency, surfaced under Infrastructure on the
+    # overview so its health is visible at a glance (probe is a short HTTP check).
+    try:
+        import admin_settings
+        from admin_services import _probe_ocr_server
+        from drug_analysis_service import DrugAnalysisConfig, DrugAnalysisService
+
+        _cfg = DrugAnalysisConfig.from_values(
+            ocr=await admin_settings.get_group(pool, "ocr"),
+            analysis=await admin_settings.get_group(pool, "analysis"),
+        )
+        _ocr = await _probe_ocr_server(DrugAnalysisService(_cfg))
+        infrastructure["ocr"] = {
+            "status": _ocr.get("status", "error"),
+            "detail": _ocr.get("message", ""),
+        }
+    except Exception as exc:
+        infrastructure["ocr"] = {"status": "error", "detail": str(exc)}
+
+    infrastructure["mcp"] = {
+        "status": "ok" if _initialized else "degraded",
+        "detail": str(config),
+    }
+
+    if pool is not None and db_ok:
+        await _module_status.refresh_if_stale_and_sync(
+            pool,
+            SERVICE_TOOLS,
+            mcp,
+            force=True,
+        )
+        cached = _module_status.get_status()
+        async with pool.acquire() as conn:
+            for key, requirements in SERVICE_MODULES.items():
+                threshold = max(req[1] for req in requirements)
+                row_count = 0
+                requirement_details: list[dict[str, Any]] = []
+                ready = True
+                for table, minimum in requirements:
+                    count = int(
+                        await conn.fetchval(f"SELECT COUNT(*) FROM {table}") or 0
+                    )
+                    row_count = max(row_count, count)
+                    requirement_details.append(
+                        {"table": table, "row_count": count, "threshold": minimum}
+                    )
+                    if count < minimum:
+                        ready = False
+                modules[key] = {
+                    "ready": bool(cached.get(key, ready)),
+                    "row_count": row_count,
+                    "threshold": threshold,
+                    "requirements": requirement_details,
+                    "cache_ttl_seconds": int(CACHE_TTL.total_seconds()),
+                }
+        try:
+            jobs = await summarize_jobs(pool)
+            workers = await list_worker_heartbeats(pool)
+        except Exception as exc:
+            infrastructure["admin_control_plane"] = {
+                "status": "degraded",
+                "detail": str(exc),
+            }
+    else:
+        for key, requirements in SERVICE_MODULES.items():
+            modules[key] = {
+                "ready": False,
+                "row_count": 0,
+                "threshold": max(req[1] for req in requirements),
+                "requirements": [],
+                "cache_ttl_seconds": int(CACHE_TTL.total_seconds()),
+            }
+        workers = []
+
+    service_registry = _admin_service_registry()
+    cached_status = _module_status.get_status()
+
+    # Collect per-service health status (ok / degraded / unavailable).
+    _health_svc_map = {
+        "icd": icd_service,
+        "lab": lab_service,
+        "guideline": guideline_service,
+        "snomed": snomed_service,
+        "health_supplements": health_supplements_service,
+        "food_nutrition": food_nutrition_service,
+        "drug": drug_service,
+        # Derived services (no own tables / no health_status()): they fall to the
+        # "inherit module readiness" branch below. Must be present here or they
+        # would always report 'unavailable' regardless of their dependency.
+        "ig": fhir_ig_service,
+        "fhir_condition": fhir_condition_service,
+        "fhir_medication": fhir_medication_service,
+    }
+    for key, initialized in service_registry.items():
+        svc = _health_svc_map.get(key)
+        health = {
+            "status": "unavailable",
+            "reason": "Not initialized",
+            "search_mode": "n/a",
+        }
+        if svc is not None and hasattr(svc, "health_status"):
+            try:
+                h = await svc.health_status()
+                health = h.as_dict()
+            except Exception as _he:
+                health = {
+                    "status": "degraded",
+                    "reason": str(_he),
+                    "search_mode": "n/a",
+                }
+        elif svc is not None:
+            # Services without health_status() (FHIR, TWCore): inherit module readiness
+            health = {
+                "status": "ok" if cached_status.get(key, False) else "unavailable",
+                "reason": "",
+                "search_mode": "n/a",
+            }
+        services[key] = {
+            "initialized": initialized,
+            "module_ready": bool(cached_status.get(key, False)),
+            "health": health,
+        }
+
+    # Modules in maintenance mode override their service status so the Overview
+    # surfaces the deliberate pause (rather than 'ok'/'degraded').
+    try:
+        maintenance_states = await admin_maintenance.get_states(database.get_pool())
+    except Exception:
+        maintenance_states = {}
+    for ds_key, on in maintenance_states.items():
+        if on and ds_key in services:
+            services[ds_key]["health"] = {
+                "status": "maintaining",
+                "reason": "Maintenance mode enabled",
+                "search_mode": "n/a",
+            }
+            services[ds_key]["maintenance"] = True
+
+    modules_ready = sum(1 for item in modules.values() if item["ready"])
+    services_initialized = sum(1 for item in services.values() if item["initialized"])
+    services_degraded = sum(
+        1
+        for item in services.values()
+        if item.get("health", {}).get("status") == "degraded"
+    )
+    infra_healthy = sum(1 for item in infrastructure.values() if item["status"] == "ok")
+    overall_status = (
+        "ok"
+        if db_ok
+        and redis_ok
+        and services_initialized == len(services)
+        and services_degraded == 0
+        else "degraded"
+    )
+
+    # External FHIR server registry — surface each server's last probe result
+    # (read from DB, no live HTTP) so the Overview shows external connectivity.
+    fhir_servers_payload: dict[str, Any] = {"total": 0, "ok": 0, "items": []}
+    try:
+        registered = await list_registered_fhir_servers(
+            database.get_pool(), include_disabled=True
+        )
+        items = [
+            {
+                "server_key": s["server_key"],
+                "name": s["name"],
+                "enabled": bool(s["enabled"]),
+                "is_default": bool(s["is_default"]),
+                "auth_profile": s.get("auth_profile") or "none",
+                "last_probe_status": s.get("last_probe_status") or "",
+                "last_probe_at": s.get("last_probe_at"),
+                "last_probe_error": s.get("last_probe_error") or "",
+            }
+            for s in registered
+        ]
+        fhir_servers_payload = {
+            "total": len(items),
+            "ok": sum(1 for s in items if s["last_probe_status"] == "ok"),
+            "items": items,
+        }
+    except Exception as exc:
+        fhir_servers_payload = {"total": 0, "ok": 0, "items": [], "error": str(exc)}
+
+    return AdminOverviewPayload(
+        generated_at=generated_at,
+        app={
+            "transport": config.transport,
+            "mcp_path": config.path,
+            "admin_enabled": _admin_enabled(),
+            "admin_ready": _admin_ready(),
+            "admin_username": config.admin_username,
+            "uptime": _format_uptime(),
+        },
+        infrastructure=infrastructure,
+        modules=modules,
+        services=services,
+        jobs=jobs,
+        workers=workers,
+        summary={
+            "overall_status": overall_status,
+            "modules_ready": modules_ready,
+            "modules_total": len(modules),
+            "services_initialized": services_initialized,
+            "services_degraded": services_degraded,
+            "services_total": len(services),
+            "infrastructure_healthy": infra_healthy,
+            "infrastructure_total": len(infrastructure),
+            "fhir_servers_total": fhir_servers_payload["total"],
+            "fhir_servers_ok": fhir_servers_payload["ok"],
+        },
+        fhir_servers=fhir_servers_payload,
+    )
 
 
 class DynamicFastMCP(FastMCP):
-    """FastMCP subclass that refreshes dataset-based tool availability on every tools/list."""
+    """FastMCP subclass that refreshes module-based tool availability on every tools/list."""
 
     async def list_tools(self) -> list:
         try:
             pool = database.get_pool()
-            await _dataset_status.refresh_if_stale_and_sync(pool, SERVICE_TOOLS, self)
+            await _module_status.refresh_if_stale_and_sync(
+                pool,
+                SERVICE_TOOLS,
+                self,
+                force=True,
+            )
         except RuntimeError:
             pass  # pool not yet initialized — return whatever tools are registered
         return await super().list_tools()
+
+    async def call_tool(self, name: str, arguments: dict):
+        # DB health gate: while the database is unavailable, block every tool
+        # except health_check and return a clear retry message instead of letting
+        # raw asyncpg errors surface. report_failure() flips the gate instantly
+        # if a tool still slips through and hits a dead connection (fail-fast).
+        if name != "health_check" and not db_health.monitor().is_healthy():
+            payload = json.dumps(
+                {
+                    "error": "database_unavailable",
+                    "message": (
+                        "The database is recovering; the system has paused "
+                        "operations. Please retry in a few seconds."
+                    ),
+                    "db_status": db_health.monitor().snapshot(),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+            return [TextContent(type="text", text=payload)]
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception as exc:
+            db_health.monitor().report_failure(exc)
+            raise
 
 
 mcp = DynamicFastMCP(
@@ -534,6 +1053,39 @@ def _load_static_file(filename: str) -> bytes | None:
 _LOGO_H_BYTES: bytes | None = _load_static_file("static/logo-h.png")
 _LOGO_S_BYTES: bytes | None = _load_static_file("static/logo-s.png")
 
+
+# ── Admin SPA (admin-ui/dist) ────────────────────────────────────────────────
+# Served only when ADMIN_UI=spa. The React build emits hashed, immutable assets
+# under dist/assets/ plus a single index.html that drives client-side routing.
+def _spa_dist_dir() -> Path | None:
+    """Locate the built admin-ui/dist directory, or None if not built/deployed."""
+    for base in [Path(__file__).parent.parent, Path("/app")]:
+        candidate = base / "admin-ui" / "dist"
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
+
+
+def _load_spa_file(rel_path: str) -> tuple[bytes, str] | None:
+    """Return (bytes, content_type) for a file under dist/, guarding against
+    path traversal. ``rel_path`` is relative to dist/ (e.g. 'assets/index.js')."""
+    dist = _spa_dist_dir()
+    if dist is None:
+        return None
+    target = (dist / rel_path).resolve()
+    try:
+        target.relative_to(dist.resolve())
+    except ValueError:
+        return None  # traversal attempt
+    if not target.is_file():
+        return None
+    content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    try:
+        return target.read_bytes(), content_type
+    except OSError:
+        return None
+
+
 # Shared HTML snippets injected into every page
 
 _PRIVACY_HTML = """\
@@ -581,8 +1133,8 @@ _PRIVACY_HTML = """\
 
 <h2>1. Overview</h2>
 <p>Taiwan Health MCP Server is an open-source Model Context Protocol (MCP) server
-that provides read-only access to Taiwan FDA, ICD-10, LOINC, SNOMED CT, RxNorm,
-and Taiwan clinical guideline data. All underlying datasets are publicly available;
+that provides read-only access to Taiwan FDA health, ICD-10, LOINC, SNOMED CT,
+and Taiwan clinical guideline data. All underlying modules are publicly available;
 this service does not collect, store, or process personal health information.</p>
 
 <h2>2. Data We Collect</h2>
@@ -601,13 +1153,12 @@ audit trail.</p>
 
 <h2>3. Data Sources</h2>
 <p>All medical terminology data served by this API originates from publicly
-available datasets:</p>
+available modules:</p>
 <ul>
   <li>ICD-10-CM / ICD-10-PCS — U.S. National Library of Medicine / CMS (public domain)</li>
   <li>LOINC 2.80 — Regenstrief Institute (LOINC License, free for most uses)</li>
   <li>SNOMED CT International — SNOMED International (SNOMED License)</li>
-  <li>RxNorm — U.S. National Library of Medicine (public domain)</li>
-  <li>Taiwan FDA drug, health food, and nutrition data — Taiwan FDA open data</li>
+  <li>Taiwan FDA health supplements and nutrition data — Taiwan FDA open data</li>
   <li>TWCore IG — Taiwan Ministry of Health and Welfare (public)</li>
 </ul>
 
@@ -713,10 +1264,10 @@ and the obligations of each party.</p>
 
 <h2>2. Nature of Processing</h2>
 <p>Taiwan Health MCP Server is a <strong>read-only query API</strong> that provides
-access to publicly available medical terminology and pharmaceutical datasets.
+access to publicly available medical terminology and pharmaceutical modules.
 It does not accept, store, or process personal health information submitted by
 users. All 28 tools perform outbound database lookups against pre-loaded public
-datasets and return structured results to the MCP client.</p>
+modules and return structured results to the MCP client.</p>
 
 <h2>3. Categories of Data Processed</h2>
 <div class="tbl-wrap"><table>
@@ -767,7 +1318,7 @@ requirements.</p>
   <tr><th>Sub-processor</th><th>Role</th><th>Data shared</th></tr>
   <tr>
     <td>PostgreSQL 16 (self-hosted)</td>
-    <td>Primary data store for terminology datasets</td>
+    <td>Primary data store for terminology modules</td>
     <td>Query strings (transient, in-process only)</td>
   </tr>
   <tr>
@@ -818,7 +1369,7 @@ breach.</p>
 <ul>
   <li><strong>Audit logs</strong> — retained for 90 days, then deleted by a scheduled purge job.</li>
   <li><strong>Redis cache</strong> — entries expire automatically per configured TTL (1–24 hours).</li>
-  <li><strong>Terminology datasets</strong> — static public data; not subject to deletion requests.</li>
+  <li><strong>Terminology modules</strong> — static public data; not subject to deletion requests.</li>
 </ul>
 
 <h2>12. Contact and Governing Law</h2>
@@ -852,6 +1403,18 @@ _LANDING_HTML = """\
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="shortcut icon" type="image/png" href="/favicon.png">
   <title>Taiwan Health MCP Server</title>
+  <meta name="color-scheme" content="light dark">
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('admin-theme');
+        if (t !== 'light' && t !== 'dark') {
+          t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    })();
+  </script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, -apple-system, sans-serif; color: #1a1a1a;
@@ -904,7 +1467,7 @@ _LANDING_HTML = """\
                        margin-top: 8px; }
     .feature-card li { margin-bottom: 4px; }
 
-    /* ── dataset table ── */
+    /* ── module table ── */
     table { width: 100%; border-collapse: collapse; font-size: 0.93rem;
             margin-top: 12px; }
     th, td { border: 1px solid #e0e0e0; padding: 9px 14px; text-align: left; }
@@ -985,6 +1548,39 @@ _LANDING_HTML = """\
     @media (max-width: 400px) {
       .link-grid { grid-template-columns: 1fr; }
     }
+
+    /* ── dark mode (follows admin-theme localStorage, else OS preference) ── */
+    [data-theme="dark"] body { background: #0f1115; color: #e6e8eb; }
+    [data-theme="dark"] nav { background: #15181e; border-bottom-color: #262b35; }
+    [data-theme="dark"] nav a { color: #b8c0cc; }
+    [data-theme="dark"] nav a:hover { color: #5aa2ff; }
+    [data-theme="dark"] section { border-bottom-color: #1d2129; }
+    [data-theme="dark"] .hero h1 span { color: #5aa2ff; }
+    [data-theme="dark"] .hero p.tagline { color: #aab2bf; }
+    [data-theme="dark"] .endpoint-box { background: #161b22; border-color: #2b3340; }
+    [data-theme="dark"] .endpoint-box .label { color: #9aa3b2; }
+    [data-theme="dark"] .endpoint-box code { color: #7cb7ff; }
+    [data-theme="dark"] .badge { background: #16263f; color: #7cb7ff; }
+    [data-theme="dark"] h2, [data-theme="dark"] h3 { color: #e6e8eb; }
+    [data-theme="dark"] .feature-card { border-color: #262b35; background: #13161c; }
+    [data-theme="dark"] .feature-card ul { color: #aab2bf; }
+    [data-theme="dark"] th, [data-theme="dark"] td { border-color: #2b3340; }
+    [data-theme="dark"] th { background: #161b22; }
+    [data-theme="dark"] .example { border-color: #262b35; }
+    [data-theme="dark"] .example-header { background: #161b22; color: #cfd5de;
+                                          border-bottom-color: #262b35; }
+    [data-theme="dark"] .prompt { background: #2a2410; border-left-color: #b8860b; }
+    [data-theme="dark"] .prompt strong { color: #e0b84d; }
+    [data-theme="dark"] .steps { color: #aab2bf; }
+    [data-theme="dark"] code.inline { background: #1b1f27; color: #e0b84d; }
+    [data-theme="dark"] .auth-notice { background: #10231a; border-color: #1f5135; }
+    [data-theme="dark"] .auth-notice strong { color: #6ee7a0; }
+    [data-theme="dark"] .link-card { border-color: #262b35; }
+    [data-theme="dark"] .link-card:hover { border-color: #5aa2ff; }
+    [data-theme="dark"] .link-card .link-title { color: #5aa2ff; }
+    [data-theme="dark"] .link-card .link-desc { color: #9aa3b2; }
+    [data-theme="dark"] footer { color: #7d8694; border-top-color: #1d2129; }
+    [data-theme="dark"] footer a { color: #5aa2ff; }
   </style>
 </head>
 <body>
@@ -997,7 +1593,7 @@ _LANDING_HTML = """\
     <ul>
       <li><a href="#description">Overview</a></li>
       <li><a href="#features">Features</a></li>
-      <li><a href="#datasets">Datasets</a></li>
+      <li><a href="#modules">Modules</a></li>
       <li><a href="#examples">Examples</a></li>
       <li><a href="#setup">Setup</a></li>
       <li><a href="#authentication">Auth</a></li>
@@ -1013,19 +1609,18 @@ _LANDING_HTML = """\
     <h1>Taiwan Health<br><span>MCP Server</span></h1>
     <p class="tagline">
       An open-source Model Context Protocol server that gives AI assistants
-      structured, read-only access to Taiwan's medical, pharmaceutical, and
-      clinical knowledge — 28 tools, production-grade, HIPAA-audited.
+      structured, read-only access to Taiwan's medical and clinical knowledge
+      for Taiwan healthcare workflows.
     </p>
     <div class="endpoint-box">
       <span class="label">MCP endpoint</span>
       <code>https://tw-health-mcp.healthymind-tech.com/mcp</code>
     </div>
     <div class="badge-row">
-      <span class="badge">30 Tools</span>
+      <span class="badge">24 Tools</span>
       <span class="badge">ICD-10-CM 2025</span>
       <span class="badge">LOINC 2.80</span>
       <span class="badge">SNOMED CT</span>
-      <span class="badge">RxNorm</span>
       <span class="badge">Taiwan FDA</span>
       <span class="badge">TWCore IG v1.0</span>
       <span class="badge">FHIR R4</span>
@@ -1039,16 +1634,15 @@ _LANDING_HTML = """\
     <h2>Description</h2>
     <p>
       Taiwan Health MCP Server connects Claude to authoritative medical and
-      health datasets curated for Taiwan's healthcare system. Clinicians,
+      health modules curated for Taiwan's healthcare system. Clinicians,
       researchers, developers, and health-tech products can query ICD-10 diagnoses
       and procedures, look up LOINC lab codes and reference ranges, navigate
-      SNOMED CT concept hierarchies, resolve drug names via RxNorm, search
-      Taiwan FDA-approved drugs and health foods, access clinical practice
-      guidelines, and generate FHIR R4-compliant resources — all through natural
-      language conversation with Claude.
+      SNOMED CT concept hierarchies, search Taiwan FDA health supplements, access
+      clinical practice guidelines, and generate FHIR R4-compliant resources
+      — all through natural language conversation with Claude.
     </p>
     <p style="margin-top:12px;">
-      All underlying datasets are publicly available. The server does
+      All underlying modules are publicly available. The server does
       <strong>not</strong> collect, store, or process personal health information.
       Audit logs record only tool names and SHA-256 parameter hashes, never raw values.
     </p>
@@ -1078,24 +1672,8 @@ _LANDING_HTML = """\
       </div>
 
       <div class="feature-card">
-        <div class="icon">💊</div>
-        <h3>Drug &amp; Pharmacy</h3>
-        <p style="font-size:0.93rem;color:#555;">
-          Taiwan FDA drug database (auto-synced every Tuesday) plus
-          RxNorm terminology and drug interaction checking.
-        </p>
-        <ul>
-          <li>Search by drug name, ingredient, or ATC class</li>
-          <li>Pill identification by appearance features</li>
-          <li>RxNorm concept resolution &amp; ingredient lookup</li>
-          <li>Drug–drug interaction checking (RxNorm)</li>
-          <li>FHIR Medication resource generation</li>
-        </ul>
-      </div>
-
-      <div class="feature-card">
-        <div class="icon">🧪</div>
-        <h3>Lab Interpretation</h3>
+      <div class="icon">🧪</div>
+      <h3>Lab Interpretation</h3>
         <p style="font-size:0.93rem;color:#555;">
           Reference ranges and clinical interpretation for LOINC-coded
           lab results, with age- and gender-specific thresholds.
@@ -1129,11 +1707,11 @@ _LANDING_HTML = """\
         <div class="icon">🍎</div>
         <h3>Food &amp; Nutrition</h3>
         <p style="font-size:0.93rem;color:#555;">
-          Taiwan FDA health food registry and food nutrition composition
+          Taiwan FDA health supplements registry and food nutrition composition
           database, with meal-level analysis.
         </p>
         <ul>
-          <li>Health food product search &amp; details</li>
+          <li>Health supplements product search &amp; details</li>
           <li>Food nutrition lookup (per 100 g)</li>
           <li>Meal nutrition analysis (multi-food)</li>
           <li>Nutrient-ranked food search</li>
@@ -1149,11 +1727,10 @@ _LANDING_HTML = """\
           with TWCore IG v1.0.0.
         </p>
         <ul>
-          <li>Condition &amp; Medication resource generation</li>
+          <li>Condition resource generation</li>
           <li>FHIR resource validation</li>
           <li>TWCore CodeSystem lookup &amp; search</li>
           <li>Diagnosis-to-FHIR one-step conversion</li>
-          <li>Drug-to-FHIR one-step conversion</li>
         </ul>
       </div>
 
@@ -1161,13 +1738,13 @@ _LANDING_HTML = """\
   </div>
 </section>
 
-<!-- ── Datasets ── -->
-<section id="datasets">
+<!-- ── Modules ── -->
+<section id="modules">
   <div class="wrap">
-    <h2>Datasets</h2>
+    <h2>Modules</h2>
     <div class="tbl-wrap"><table>
       <tr>
-        <th>Dataset</th><th>Version / Source</th><th>Sync</th>
+        <th>Module</th><th>Version / Source</th><th>Sync</th>
       </tr>
       <tr>
         <td>ICD-10-CM &amp; ICD-10-PCS</td>
@@ -1183,16 +1760,6 @@ _LANDING_HTML = """\
         <td>SNOMED CT International</td>
         <td>Latest RF2 — SNOMED International</td>
         <td>Static (data-loader)</td>
-      </tr>
-      <tr>
-        <td>RxNorm</td>
-        <td>Full release — NLM (public domain)</td>
-        <td>Static (data-loader)</td>
-      </tr>
-      <tr>
-        <td>Taiwan FDA Drugs</td>
-        <td>Open Data — Taiwan FDA</td>
-        <td>Auto-sync every Tuesday 02:00 UTC</td>
       </tr>
       <tr>
         <td>Taiwan FDA Health Supplements</td>
@@ -1256,39 +1823,23 @@ _LANDING_HTML = """\
     </div>
 
     <div class="example">
-      <div class="example-header">Example 3 — Drug identification &amp; interaction check</div>
+      <div class="example-header">Example 3 — FHIR resource generation</div>
       <div class="example-body">
         <div class="prompt">
           <strong>User prompt</strong>
-          "幫我查一顆白色橢圓形藥丸，上面印有 MET 500，並確認它和 Warfarin 有沒有交互作用"
-        </div>
-        <ol class="steps">
-          <li>Server runs pill identification: white + oval + marking "MET 500"</li>
-          <li>Returns top matches — likely Metformin 500 mg products with manufacturer details</li>
-          <li>Resolves Metformin and Warfarin to RxNorm concepts</li>
-          <li>Checks drug interaction database — no direct RxNorm interaction flagged for this pair</li>
-        </ol>
-      </div>
-    </div>
-
-    <div class="example">
-      <div class="example-header">Example 4 — FHIR resource generation</div>
-      <div class="example-body">
-        <div class="prompt">
-          <strong>User prompt</strong>
-          "幫我把診斷 E11.9 和藥品 Metformin 500mg 轉成 TWCore FHIR 格式"
+          "幫我把診斷 E11.9 轉成 TWCore FHIR 格式"
         </div>
         <ol class="steps">
           <li>Server calls <code>query_fhir_condition</code> for E11.9</li>
-          <li>Generates TWCore-compliant FHIR Condition resource with ICD-10 coding</li>
-          <li>Calls <code>query_fhir_medication</code> for Metformin</li>
-          <li>Returns valid FHIR R4 JSON resources ready for EMR integration</li>
+          <li>Generates a TWCore-compliant FHIR Condition resource with ICD-10 coding</li>
+          <li>Applies optional status fields such as clinical and verification status</li>
+          <li>Returns valid FHIR R4 JSON ready for EMR integration</li>
         </ol>
       </div>
     </div>
 
     <div class="example">
-      <div class="example-header">Example 5 — Nutrition analysis</div>
+      <div class="example-header">Example 4 — Nutrition analysis</div>
       <div class="example-body">
         <div class="prompt">
           <strong>User prompt</strong>
@@ -1299,6 +1850,22 @@ _LANDING_HTML = """\
           <li>Aggregates macronutrients: calories, carbohydrates, protein, fat, fiber per 100 g</li>
           <li>Returns per-food breakdown plus combined totals</li>
           <li>Highlights carbohydrate content relevant for diabetes meal planning</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="example">
+      <div class="example-header">Example 5 — Health supplement search</div>
+      <div class="example-body">
+        <div class="prompt">
+          <strong>User prompt</strong>
+          "幫我找有調節血脂功效的台灣健康補充品"
+        </div>
+        <ol class="steps">
+          <li>Server searches the Taiwan FDA health supplement registry by benefit keywords</li>
+          <li>Ranks certified products by product name, ingredients, and approved claims</li>
+          <li>Returns permit number, company, ingredients, and approved benefit text</li>
+          <li>Helps narrow candidates for further clinical or regulatory review</li>
         </ol>
       </div>
     </div>
@@ -1352,7 +1919,7 @@ _LANDING_HTML = """\
       <strong>&#10003; No authentication required.</strong>
       <p style="margin-top:8px;font-size:0.95rem;">
         Taiwan Health MCP Server provides read-only access to publicly available
-        datasets. No account, API key, or OAuth flow is needed. Simply connect
+        modules. No account, API key, or OAuth flow is needed. Simply connect
         and start querying.
       </p>
     </div>
@@ -1450,22 +2017,17 @@ _TOOL_GROUPS: dict[str, dict[str, object]] = {
         ],
     },
     "drug": {
-        "category": "Drug",
+        "category": "Drug / TFDA",
         "tools": [
             (
                 "search_drug",
                 "search_drug",
-                {"mode": "drug_name", "keyword": "Metformin", "limit": 5},
+                {"mode": "drug_name", "keyword": "普拿疼", "limit": 5},
             ),
             (
                 "search_drug",
                 "search_drug",
-                {"mode": "atc_code", "keyword": "A10BA02", "limit": 5},
-            ),
-            (
-                "search_drug",
-                "search_drug",
-                {"mode": "ingredient", "keyword": "metformin", "limit": 5},
+                {"mode": "ingredient", "keyword": "acetaminophen", "limit": 5},
             ),
             (
                 "search_drug",
@@ -1475,25 +2037,22 @@ _TOOL_GROUPS: dict[str, dict[str, object]] = {
             (
                 "search_drug",
                 "search_drug",
-                {"mode": "rxnorm_resolve", "keyword": "atorvastatin", "limit": 5},
-            ),
-            (
-                "search_drug",
-                "search_drug",
-                {"mode": "rxnorm_ingredients", "keyword": "41493"},
-            ),
-            (
-                "search_drug",
-                "search_drug",
-                {
-                    "mode": "interaction",
-                    "drug_names": ["warfarin", "aspirin"],
-                },
+                {"mode": "atc_code", "keyword": "N02BE01", "limit": 5},
             ),
             (
                 "identify_unknown_pill",
                 "identify_unknown_pill",
                 {"features": "white round"},
+            ),
+            (
+                "get_drug_details",
+                "get_drug_details",
+                {"license_id": "衛署藥製字第000480號"},
+            ),
+            (
+                "get_drug_asset_links",
+                "get_drug_asset_links",
+                {"license_id": "衛署藥製字第000480號", "asset_group": "insert"},
             ),
         ],
     },
@@ -1528,7 +2087,12 @@ _TOOL_GROUPS: dict[str, dict[str, object]] = {
             (
                 "query_loinc",
                 "query_loinc",
-                {"mode": "reference_range", "loinc_code": "2345-7", "age": 45, "gender": "M"},
+                {
+                    "mode": "reference_range",
+                    "loinc_code": "2345-7",
+                    "age": 45,
+                    "gender": "M",
+                },
             ),
             (
                 "interpret_lab_result",
@@ -1610,44 +2174,164 @@ _TOOL_GROUPS: dict[str, dict[str, object]] = {
             (
                 "query_fhir_medication",
                 "query_fhir_medication",
-                {"keyword": "Metformin", "resource_type": "MedicationKnowledge"},
+                {"keyword": "普拿疼", "resource_type": "Medication"},
+            ),
+            (
+                "query_fhir_medication",
+                "query_fhir_medication",
+                {
+                    "license_id": "衛署藥製字第000480號",
+                    "resource_type": "MedicationKnowledge",
+                },
             ),
             (
                 "validate_fhir_medication",
                 "validate_fhir_medication",
                 {
-                    "medication_json": '{"resourceType":"Medication","code":{"coding":[{"system":"https://twcore.mohw.gov.tw/ig/twcore/CodeSystem/medication-fda-tw","code":"衛部藥製字第059686號","display":"Metformin 500mg"}]},"ingredient":[{"itemCodeableConcept":{"coding":[{"code":"metformin"}]},"strength":{"numerator":{"value":500,"unit":"mg"}}}]}'
+                    "medication_json": '{"resourceType":"Medication","code":{"coding":[{"system":"https://mcp.fda.gov.tw/fhir/CodeSystem/tfda-license-id","code":"衛署藥製字第000480號","display":"Test Drug"}]},"ingredient":[{"itemCodeableConcept":{"text":"Acetaminophen"}}]}'
                 },
             ),
         ],
     },
-    "twcore": {
-        "category": "TWCore IG",
+    "ig": {
+        "category": "FHIR IG",
         "tools": [
-            ("query_twcore_code", "query_twcore_code", {"category": "medication"}),
+            ("fhir_list_igs", "fhir_list_igs", {}),
+            ("fhir_get_ig", "fhir_get_ig", {}),
             (
-                "query_twcore_code",
-                "query_twcore_code",
-                {"code": "QD", "codesystem_id": "medication-frequency-nhi-tw"},
+                "fhir_list_artifacts",
+                "fhir_list_artifacts",
+                {"resource_type": "StructureDefinition"},
+            ),
+            (
+                "fhir_search_artifacts",
+                "fhir_search_artifacts",
+                {"keyword": "Patient"},
+            ),
+            (
+                "fhir_list_resource_profiles",
+                "fhir_list_resource_profiles",
+                {"base_type": "Condition"},
+            ),
+            (
+                "fhir_rank_resource_profiles",
+                "fhir_rank_resource_profiles",
+                {"keys": ["code", "subject", "onset"], "base_type": "Condition"},
+            ),
+            (
+                "fhir_get_profile",
+                "fhir_get_profile",
+                {"identifier": "Condition-twcore"},
+            ),
+            (
+                "fhir_get_profile_elements",
+                "fhir_get_profile_elements",
+                {
+                    "profile": "Condition-twcore",
+                    "view": "choices",
+                    "path": "Condition.onset[x]",
+                },
+            ),
+            (
+                "fhir_get_valueset",
+                "fhir_get_valueset",
+                {"identifier": "condition-code-sct-tw"},
+            ),
+            (
+                "fhir_expand_valueset",
+                "fhir_expand_valueset",
+                {"identifier": "condition-code-sct-tw", "limit": 50},
+            ),
+            (
+                "fhir_lookup_code",
+                "fhir_lookup_code",
+                {"system": "http://snomed.info/sct", "code": "6142004"},
+            ),
+            (
+                "fhir_validate_code",
+                "fhir_validate_code",
+                {
+                    "system": "http://snomed.info/sct",
+                    "code": "6142004",
+                    "value_set": "condition-code-sct-tw",
+                },
+            ),
+            (
+                "fhir_normalize_code",
+                "fhir_normalize_code",
+                {"text": "流行性感冒", "value_set": "condition-code-sct-tw"},
+            ),
+            (
+                "fhir_resolve_reference",
+                "fhir_resolve_reference",
+                {"key": "patient-1", "resource_type": "Patient"},
+            ),
+            (
+                "fhir_build_bundle",
+                "fhir_build_bundle",
+                {
+                    "entries": [
+                        {"key": "patient-1", "resource": {"resourceType": "Patient"}}
+                    ],
+                    "bundle_type": "transaction",
+                },
+            ),
+            (
+                "fhir_validate_resource",
+                "fhir_validate_resource",
+                {
+                    "resource": {
+                        "resourceType": "Condition",
+                        "meta": {
+                            "profile": [
+                                "https://twcore.mohw.gov.tw/ig/twcore/StructureDefinition/Condition-twcore"
+                            ]
+                        },
+                    }
+                },
+            ),
+            (
+                "fhir_validate_bundle",
+                "fhir_validate_bundle",
+                {
+                    "bundle": {
+                        "resourceType": "Bundle",
+                        "type": "transaction",
+                        "entry": [],
+                    }
+                },
+            ),
+            (
+                "fhir_get_resource_skeleton",
+                "fhir_get_resource_skeleton",
+                {"profile": "Condition-twcore"},
+            ),
+            (
+                "fhir_finalize_resource",
+                "fhir_finalize_resource",
+                {
+                    "profile": "Condition-twcore",
+                    "draft": {"resourceType": "Condition"},
+                },
             ),
         ],
     },
-    "health_food": {
-        "category": "Health Supplement",
+    "health_supplements": {
+        "category": "Health Supplements",
         "tools": [
             (
-                "search_health_supplement",
-                "search_health_supplement",
+                "search_health_supplements",
+                "search_health_supplements",
                 {"mode": "keyword", "keyword": "魚油", "limit": 5},
             ),
             (
-                "search_health_supplement",
-                "search_health_supplement",
+                "search_health_supplements",
+                "search_health_supplements",
                 {"mode": "permit_no", "keyword": "A00022"},
             ),
             (
-                "search_health_supplement",
-                "search_health_supplement",
+                "search_health_supplements",
+                "search_health_supplements",
                 {"mode": "condition", "keyword": "E11", "limit": 5},
             ),
         ],
@@ -1674,6 +2358,29 @@ _TOOL_GROUPS: dict[str, dict[str, object]] = {
                 "analyze_meal_nutrition",
                 "analyze_meal_nutrition",
                 {"foods": ["白米飯", "雞胸肉", "花椰菜", "豆腐"]},
+            ),
+        ],
+    },
+    "fhir_server": {
+        "category": "FHIR Servers",
+        "tools": [
+            (
+                "list_fhir_servers",
+                "list_fhir_servers",
+                {"include_disabled": False},
+            ),
+            (
+                "get_fhir_server_status",
+                "get_fhir_server_status",
+                {"server_key": "default"},
+            ),
+            (
+                "crud_fhir_server",
+                "crud_fhir_server",
+                {
+                    "server_key": "default",
+                    "operation": "metadata",
+                },
             ),
         ],
     },
@@ -1706,14 +2413,15 @@ def _build_tool_maps():
                     field_value = example.get(field)
                     if isinstance(field_value, str) and field_value:
                         (
-                            tool_selector_examples.setdefault(name, {})
-                            .setdefault(field, {})
+                            tool_selector_examples.setdefault(name, {}).setdefault(
+                                field, {}
+                            )
                         )[field_value] = example
-            if service_key != "system":
+            if service_key not in {"system", "fhir_server"}:
                 if name not in seen_names:
                     tools.append((fn, name))
                     seen_names.add(name)
-        if service_key != "system":
+        if service_key not in {"system", "fhir_server"}:
             service_tools[service_key] = tools
     return tool_category_map, tool_examples, tool_selector_examples, service_tools
 
@@ -1739,6 +2447,18 @@ _STATUS_HTML_TEMPLATE = """\
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="shortcut icon" type="image/png" href="/favicon.png">
   <title>Status &amp; Tool Tester – Taiwan Health MCP</title>
+  <meta name="color-scheme" content="light dark">
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('admin-theme');
+        if (t !== 'light' && t !== 'dark') {
+          t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    })();
+  </script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html { height: 100%; }
@@ -1887,6 +2607,45 @@ _STATUS_HTML_TEMPLATE = """\
         max-width: 100%; }
       header h1 { font-size: 0.82rem; }
     }
+
+    /* ── dark mode (follows admin-theme localStorage, else OS preference) ──
+       The JSON tree (.json-tree) is intentionally dark in both themes. */
+    [data-theme="dark"] body { background: #0f1115; color: #e6e8eb; }
+    [data-theme="dark"] header { background: #15181e; border-bottom-color: #262b35; }
+    [data-theme="dark"] .stats { color: #9aa3b2; }
+    [data-theme="dark"] .stats b { color: #6ee7a0; }
+    [data-theme="dark"] .hdr-link { color: #5aa2ff; }
+    [data-theme="dark"] .left { background: #13161c; border-right-color: #262b35; }
+    [data-theme="dark"] .search-wrap input { background: #0f1115; border-color: #2b3340;
+                                             color: #e6e8eb; }
+    [data-theme="dark"] .search-wrap input:focus { border-color: #5aa2ff; }
+    [data-theme="dark"] .cat-row { border-bottom-color: #1d2129; }
+    [data-theme="dark"] .cat-btn { background: #161b22; border-color: #2b3340; color: #aab2bf; }
+    [data-theme="dark"] .cat-btn:hover { border-color: #5aa2ff; color: #5aa2ff; }
+    [data-theme="dark"] .cat-btn.on { background: #2563eb; color: #fff; border-color: #2563eb; }
+    [data-theme="dark"] .t-item:hover { background: #1a2029; }
+    [data-theme="dark"] .t-item.sel { background: #16263f; border-left-color: #5aa2ff; }
+    [data-theme="dark"] .tname { color: #cfd5de; }
+    [data-theme="dark"] .empty { color: #5b636f; }
+    [data-theme="dark"] .th h2 { color: #e6e8eb; }
+    [data-theme="dark"] .bc { background: #16263f; color: #7cb7ff; }
+    [data-theme="dark"] .ba-on { background: #10231a; color: #6ee7a0; }
+    [data-theme="dark"] .ba-off { background: #1b1f27; color: #9aa3b2; }
+    [data-theme="dark"] .tdesc { color: #aab2bf; }
+    [data-theme="dark"] hr.div { border-top-color: #1d2129; }
+    [data-theme="dark"] .sec-title { color: #cfd5de; }
+    [data-theme="dark"] .fg label { color: #e6e8eb; }
+    [data-theme="dark"] .fdesc { color: #8b94a3; }
+    [data-theme="dark"] .fg input[type=text], [data-theme="dark"] .fg input[type=number],
+    [data-theme="dark"] .fg select, [data-theme="dark"] .fg textarea {
+      background: #0f1115; border-color: #2b3340; color: #e6e8eb; }
+    [data-theme="dark"] .fg input:focus, [data-theme="dark"] .fg select:focus,
+    [data-theme="dark"] .fg textarea:focus { border-color: #5aa2ff; }
+    [data-theme="dark"] .no-params { color: #7d8694; }
+    [data-theme="dark"] .res-meta { color: #8b94a3; }
+    [data-theme="dark"] .copy-btn { background: #161b22; border-color: #2b3340; color: #cfd5de; }
+    [data-theme="dark"] .copy-btn:hover { border-color: #5aa2ff; }
+    [data-theme="dark"] .unavail { background: #13161c; border-color: #262b35; color: #9aa3b2; }
   </style>
 </head>
 <body>
@@ -2105,8 +2864,8 @@ function renderDetail(t) {
       </div>
     ` : `
       <div class="unavail">
-        This tool is currently unavailable — its dataset has not been loaded yet.<br>
-        Run <code>docker compose run --rm data-loader --all</code> to populate the data.
+        This tool is currently unavailable — its module hasn't been loaded yet.<br>
+        Load it from the <strong>Admin console &rarr; Modules</strong> tab.
       </div>
     `}`;
   applyExamples(t.name);
@@ -2430,6 +3189,90 @@ init();
 """
 
 
+# ---------------------------------------------------------------------------
+# OpenAPI bridge — expose the MCP tools as a plain OpenAPI tool server so
+# OpenAPI-only clients (e.g. Open WebUI's "External Tools") can call them
+# directly, without a separate mcpo proxy/container.
+#   GET  /openapi.json   → spec of the currently-registered tools
+#   POST /tools/<name>   → invoke a tool with a JSON body of arguments
+# ---------------------------------------------------------------------------
+
+_OPENAPI_TOOL_PREFIX = "/tools/"
+
+
+def _origin_from_scope(scope) -> str:
+    """Best-effort public origin (scheme://host) for the OpenAPI ``servers`` block."""
+    headers = {k.lower(): v for k, v in (scope.get("headers") or [])}
+    host = headers.get(b"host", b"").decode("latin-1").strip()
+    scheme = scope.get("scheme", "http")
+    forwarded_proto = headers.get(b"x-forwarded-proto")
+    if forwarded_proto:
+        scheme = forwarded_proto.decode("latin-1").split(",")[0].strip() or scheme
+    return f"{scheme}://{host}" if host else ""
+
+
+def _extract_text_from_tool_result(result) -> str:
+    """Flatten an mcp ``call_tool`` result (list, or ``(content, structured)``
+    tuple) into the concatenated text of its text content blocks."""
+    content = result[0] if isinstance(result, tuple) else result
+    parts: list[str] = []
+    try:
+        for block in content:
+            text = getattr(block, "text", None)
+            if text is not None:
+                parts.append(text)
+    except TypeError:
+        return str(content)
+    return "\n".join(parts)
+
+
+async def _build_openapi_spec(server_url: str) -> dict:
+    """Build an OpenAPI 3.1 spec exposing the currently-registered MCP tools.
+
+    Each tool ``foo`` becomes ``POST /tools/foo`` with the tool's JSON-Schema
+    input as the request body and ``operationId = foo``.
+    """
+    tools = await mcp.list_tools()
+    paths: dict = {}
+    for tool in tools:
+        schema = tool.inputSchema or {"type": "object", "properties": {}}
+        description = (tool.description or "").strip()
+        summary = description.splitlines()[0][:120] if description else tool.name
+        paths[f"{_OPENAPI_TOOL_PREFIX}{tool.name}"] = {
+            "post": {
+                "operationId": tool.name,
+                "summary": summary,
+                "description": description,
+                "requestBody": {
+                    "required": bool(schema.get("required")),
+                    "content": {"application/json": {"schema": schema}},
+                },
+                "responses": {
+                    "200": {
+                        "description": "Tool result",
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    }
+                },
+            }
+        }
+    spec: dict = {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Taiwan Health MCP — OpenAPI bridge",
+            "description": (
+                "REST/OpenAPI surface over the Taiwan Health MCP tools, for "
+                "OpenAPI tool clients such as Open WebUI. Tools are the same ones "
+                "served over MCP at the streamable-http endpoint."
+            ),
+            "version": "1.0.0",
+        },
+        "paths": paths,
+    }
+    if server_url:
+        spec["servers"] = [{"url": server_url}]
+    return spec
+
+
 class PrivacyPageMiddleware:
     """Serve static pages (/, /privacy, /dpa, /status) and static assets (logos, favicon)."""
 
@@ -2462,24 +3305,2760 @@ class PrivacyPageMiddleware:
             {"type": "http.response.body", "body": b"Not Found", "more_body": False}
         )
 
-    async def _send_html(self, send, body: bytes):
+    async def _send_html(
+        self,
+        send,
+        body: bytes,
+        *,
+        status: int = 200,
+        extra_headers: list[tuple[bytes, bytes]] | None = None,
+    ):
+        headers = [
+            (b"content-type", b"text/html; charset=utf-8"),
+            (b"content-length", str(len(body)).encode()),
+            (b"cache-control", b"public, max-age=300"),
+        ]
+        if extra_headers:
+            headers.extend(extra_headers)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async def _send_json(
+        self,
+        send,
+        body: str,
+        *,
+        status: int = 200,
+        extra_headers: list[tuple[bytes, bytes]] | None = None,
+    ):
+        payload = body.encode("utf-8")
+        headers = [
+            (b"content-type", b"application/json; charset=utf-8"),
+            (b"content-length", str(len(payload)).encode()),
+            (b"cache-control", b"no-store"),
+        ]
+        if extra_headers:
+            headers.extend(extra_headers)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": payload, "more_body": False})
+
+    async def _send_redirect(
+        self,
+        send,
+        location: str,
+        *,
+        status: int = 303,
+        extra_headers: list[tuple[bytes, bytes]] | None = None,
+    ):
+        headers = [(b"location", location.encode("utf-8"))]
+        if extra_headers:
+            headers.extend(extra_headers)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def _send_asset(
+        self,
+        send,
+        body: bytes,
+        content_type: str,
+        *,
+        cache_control: str = "public, max-age=300",
+    ):
         await send(
             {
                 "type": "http.response.start",
                 "status": 200,
                 "headers": [
-                    (b"content-type", b"text/html; charset=utf-8"),
+                    (b"content-type", content_type.encode()),
                     (b"content-length", str(len(body)).encode()),
-                    (b"cache-control", b"public, max-age=300"),
+                    (b"cache-control", cache_control.encode()),
                 ],
             }
         )
         await send({"type": "http.response.body", "body": body, "more_body": False})
 
+    async def _read_body(self, receive) -> bytes:
+        chunks: list[bytes] = []
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] != "http.request":
+                continue
+            body = message.get("body", b"")
+            if body:
+                chunks.append(body)
+            more_body = bool(message.get("more_body", False))
+        return b"".join(chunks)
+
+    async def _send_cors_preflight(self, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 204,
+                "headers": [
+                    (b"access-control-allow-origin", b"*"),
+                    (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
+                    (b"access-control-allow-headers", b"content-type, authorization"),
+                    (b"content-length", b"0"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def _handle_openapi_tool_call(self, tool_name, receive, send):
+        """Invoke an MCP tool from a POST /tools/<name> request and return JSON."""
+        raw = await self._read_body(receive)
+        if raw.strip():
+            try:
+                arguments = json.loads(raw.decode("utf-8"))
+            except Exception:
+                await self._send_json(
+                    send, json.dumps({"error": "invalid_json_body"}), status=400
+                )
+                return
+            if not isinstance(arguments, dict):
+                await self._send_json(
+                    send,
+                    json.dumps({"error": "body_must_be_a_json_object"}),
+                    status=400,
+                )
+                return
+        else:
+            arguments = {}
+        try:
+            await _ensure_runtime_ready()
+        except Exception as exc:
+            await self._send_json(
+                send,
+                json.dumps({"error": "server_not_ready", "detail": str(exc)}),
+                status=503,
+            )
+            return
+        try:
+            result = await mcp.call_tool(tool_name, arguments)
+        except Exception as exc:
+            await self._send_json(
+                send,
+                json.dumps(
+                    {"error": "tool_call_failed", "tool": tool_name, "detail": str(exc)},
+                    ensure_ascii=False,
+                ),
+                status=400,
+            )
+            return
+        text = _extract_text_from_tool_result(result)
+        try:
+            body = json.dumps(json.loads(text), ensure_ascii=False, default=str)
+        except Exception:
+            body = json.dumps({"result": text}, ensure_ascii=False)
+        await self._send_json(
+            send,
+            body,
+            extra_headers=[(b"access-control-allow-origin", b"*")],
+        )
+
     async def __call__(self, scope, receive, send):
+        # ── ASGI lifespan: hook process shutdown ──────────────────────────────
+        # uvicorn drives this once per process. Wrap receive() so that when the
+        # shutdown event arrives we cancel the relay task before the inner app
+        # (and then the event loop) tears down — avoiding pending-task noise.
+        if scope["type"] == "lifespan":
+
+            async def lifespan_receive():
+                message = await receive()
+                if message["type"] == "lifespan.shutdown":
+                    await _shutdown_ws_relay()
+                return message
+
+            await self.app(scope, lifespan_receive, send)
+            return
+
+        # ── WebSocket: /admin/ws ──────────────────────────────────────────────
+        if scope["type"] == "websocket":
+            path = scope.get("path", "")
+            if path == "/admin/ws":
+                if not _admin_enabled() or not _admin_ready():
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                if not _admin_username_from_scope(scope):
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                await handle_admin_websocket(scope, receive, send)
+                return
+            await self.app(scope, receive, send)
+            return
+
         if scope["type"] == "http":
             method = scope.get("method", "")
-            path = scope.get("path", "").rstrip("/")
+            path = scope.get("path", "").rstrip("/") or "/"
+
+            # ── OpenAPI bridge (for OpenAPI tool clients, e.g. Open WebUI) ────
+            if path == "/openapi.json":
+                if method == "OPTIONS":
+                    await self._send_cors_preflight(send)
+                    return
+                if method != "GET":
+                    await self._send_json(
+                        send,
+                        json.dumps({"error": "method_not_allowed"}),
+                        status=405,
+                    )
+                    return
+                try:
+                    await _ensure_runtime_ready()
+                    spec = await _build_openapi_spec(_origin_from_scope(scope))
+                    await self._send_json(
+                        send,
+                        json.dumps(spec, ensure_ascii=False, default=str),
+                        extra_headers=[(b"access-control-allow-origin", b"*")],
+                    )
+                except Exception as exc:
+                    await self._send_json(
+                        send,
+                        json.dumps(
+                            {"error": "openapi_unavailable", "detail": str(exc)}
+                        ),
+                        status=500,
+                    )
+                return
+
+            if path.startswith(_OPENAPI_TOOL_PREFIX) and len(path) > len(
+                _OPENAPI_TOOL_PREFIX
+            ):
+                if method == "OPTIONS":
+                    await self._send_cors_preflight(send)
+                    return
+                if method != "POST":
+                    await self._send_json(
+                        send,
+                        json.dumps({"error": "method_not_allowed"}),
+                        status=405,
+                    )
+                    return
+                await self._handle_openapi_tool_call(
+                    path[len(_OPENAPI_TOOL_PREFIX):], receive, send
+                )
+                return
+
+            # ── Public per-server JWKS endpoint ───────────────────────────────
+            # An OAuth Server fetches our client's public signing key here,
+            # server-to-server, with no admin session. Only public keys are
+            # exposed; the server id (a UUID) acts as the capability.
+            jwks_match = re.match(r"^/fhir-client/([^/]+)/jwks\.json$", path)
+            if jwks_match:
+                if method != "GET":
+                    await self._send_json(
+                        send,
+                        json.dumps({"error": "method_not_allowed"}),
+                        status=405,
+                    )
+                    return
+                if not db_health.monitor().is_healthy():
+                    await self._send_json(
+                        send,
+                        json.dumps({"error": "database_unavailable"}),
+                        status=503,
+                    )
+                    return
+                try:
+                    await _ensure_runtime_ready()
+                    pool = database.get_pool()
+                    jwks = await get_fhir_server_jwks(pool, jwks_match.group(1))
+                except Exception as exc:
+                    db_health.monitor().report_failure(exc)
+                    await self._send_json(
+                        send,
+                        json.dumps({"error": "jwks_unavailable"}),
+                        status=503,
+                    )
+                    return
+                if jwks is None:
+                    await self._send_json(
+                        send,
+                        json.dumps({"error": "not_found"}),
+                        status=404,
+                    )
+                    return
+                await self._send_json(
+                    send,
+                    json.dumps(jwks, ensure_ascii=False),
+                )
+                return
+
+            is_admin_route = path == "/admin" or path.startswith("/admin/")
+            if is_admin_route:
+                if not _admin_enabled():
+                    await self._send_404(send)
+                    return
+
+                if not _admin_ready():
+                    message = "Admin console is enabled but not fully configured."
+                    if path.startswith("/admin/api/"):
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": message,
+                                    "hint": "Set ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and ADMIN_SESSION_SECRET.",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=503,
+                        )
+                    else:
+                        await self._send_html(
+                            send,
+                            build_admin_login_html(error_message=message).encode(
+                                "utf-8"
+                            ),
+                            status=503,
+                        )
+                    return
+
+                admin_username = _admin_username_from_scope(scope)
+
+                if method == "GET" and path == "/admin/login":
+                    if admin_username:
+                        await self._send_redirect(send, "/admin")
+                    else:
+                        await self._send_html(
+                            send, build_admin_login_html().encode("utf-8")
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/login":
+                    raw_body = await self._read_body(receive)
+                    form = parse_qs(raw_body.decode("utf-8", errors="replace"))
+                    username = (form.get("username", [""])[0] or "").strip()
+                    password = form.get("password", [""])[0] or ""
+                    if username == config.admin_username and verify_admin_password(
+                        password, config.admin_password_hash
+                    ):
+                        max_age_seconds = max(config.admin_session_ttl_minutes, 1) * 60
+                        token = build_admin_session_token(
+                            username,
+                            config.admin_session_secret,
+                            ttl_minutes=config.admin_session_ttl_minutes,
+                        )
+                        await self._send_redirect(
+                            send,
+                            "/admin",
+                            extra_headers=[
+                                (
+                                    b"set-cookie",
+                                    build_admin_session_cookie(
+                                        token, max_age_seconds=max_age_seconds
+                                    ).encode("utf-8"),
+                                )
+                            ],
+                        )
+                    else:
+                        await self._send_html(
+                            send,
+                            build_admin_login_html(
+                                error_message="Invalid username or password."
+                            ).encode("utf-8"),
+                            status=401,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/logout":
+                    await self._send_redirect(
+                        send,
+                        "/admin/login",
+                        extra_headers=[
+                            (
+                                b"set-cookie",
+                                clear_admin_session_cookie().encode("utf-8"),
+                            )
+                        ],
+                    )
+                    return
+
+                if not admin_username:
+                    if path.startswith("/admin/api/"):
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Authentication required",
+                                    "hint": "Sign in at /admin/login first.",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=401,
+                        )
+                    else:
+                        await self._send_redirect(send, "/admin/login")
+                    return
+
+                # DB health endpoint — always available (never gated) so the UI
+                # can poll status even while the database is down.
+                if method == "GET" and path == "/admin/api/health":
+                    await self._send_json(
+                        send,
+                        json.dumps(
+                            db_health.monitor().snapshot(),
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    )
+                    return
+
+                # DB health gate — block every other admin API operation (reads
+                # and writes) while the database is unavailable. The SPA shell and
+                # static assets are served above, so the UI still loads and shows
+                # its recovery overlay; only data operations are paused.
+                if (
+                    path.startswith("/admin/api/")
+                    and not db_health.monitor().is_healthy()
+                ):
+                    await self._send_json(
+                        send,
+                        json.dumps(
+                            {
+                                "error": "database_unavailable",
+                                "message": "Operations are paused until the database recovers.",
+                                "db_status": db_health.monitor().snapshot(),
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                        status=503,
+                    )
+                    return
+
+                if path.startswith("/admin/api/"):
+                    try:
+                        await _ensure_runtime_ready()
+                    except Exception as exc:
+                        db_health.monitor().report_failure(exc)
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Admin runtime initialization failed",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                        return
+
+                # ── Admin SPA: serve hashed assets and the index.html shell for
+                #    every client-side route (the React UI in admin-ui/dist). ──
+                if method == "GET" and not path.startswith("/admin/api/"):
+                    rel = path[len("/admin") :].lstrip("/")  # "" for /admin
+                    last_segment = rel.rsplit("/", 1)[-1]
+                    if "." in last_segment:
+                        # A static file request (hashed asset, favicon, …).
+                        asset = _load_spa_file(rel)
+                        if asset is not None:
+                            body, ctype = asset
+                            cache = (
+                                "public, max-age=31536000, immutable"
+                                if rel.startswith("assets/")
+                                else "public, max-age=3600"
+                            )
+                            await self._send_asset(
+                                send, body, ctype, cache_control=cache
+                            )
+                            return
+                        await self._send_404(send)
+                        return
+                    # Client-side route → serve the SPA shell (uncached so new
+                    # deploys propagate immediately).
+                    shell = _load_spa_file("index.html")
+                    if shell is not None:
+                        await self._send_asset(
+                            send,
+                            shell[0],
+                            "text/html; charset=utf-8",
+                            cache_control="no-store",
+                        )
+                        return
+                    # dist/ not built — surface a clear, actionable error.
+                    await self._send_html(
+                        send,
+                        b"<h1>Admin UI not built</h1><p>Run <code>cd admin-ui &amp;&amp; "
+                        b"npm install &amp;&amp; npm run build</code>, or rebuild the "
+                        b"Docker image (the frontend stage builds it automatically).</p>",
+                        status=503,
+                    )
+                    return
+
+                if method == "GET" and path == "/admin/api/overview":
+                    payload = await _build_admin_overview_payload()
+                    await self._send_json(send, payload.to_json())
+                    return
+
+                # ── Implementation Guides (IG) module ─────────────────────
+                if method == "GET" and path == "/admin/api/registry/search":
+                    import fhir_registry
+
+                    q = _parse_query_params(scope).get("q", "")
+                    try:
+                        pool = database.get_pool()
+                        import admin_settings
+
+                        cfg = await admin_settings.get_group(pool, "registry")
+                        results = await fhir_registry.search(cfg.get("base_url"), q)
+                        await self._send_json(
+                            send,
+                            json.dumps({"results": results}, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Registry search failed", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=502,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/igs":
+                    import admin_ig
+
+                    pool = database.get_pool()
+                    igs = await admin_ig.list_igs(pool)
+                    await self._send_json(
+                        send,
+                        json.dumps({"igs": igs}, ensure_ascii=False, default=str),
+                    )
+                    return
+
+                if method == "POST" and path == "/admin/api/igs/import":
+                    import admin_ig  # noqa: F401  (kept symmetrical with siblings)
+
+                    try:
+                        body = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    source = str(body.get("source", "") or "").strip()
+                    options: dict[str, Any] = {}
+                    if source == "registry":
+                        pkg_id = str(body.get("package_id", "") or "").strip()
+                        if not pkg_id:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "package_id is required for registry import"
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=400,
+                            )
+                            return
+                        options = {
+                            "ig_source": "registry",
+                            "package_id": pkg_id,
+                            "version": str(body.get("version", "") or "").strip(),
+                        }
+                    elif source == "upload":
+                        uploaded_file_id = str(
+                            body.get("uploaded_file_id", "") or ""
+                        ).strip()
+                        object_key = str(body.get("object_key", "") or "").strip()
+                        try:
+                            pool = database.get_pool()
+                            if not object_key and uploaded_file_id:
+                                async with pool.acquire() as conn:
+                                    row = await conn.fetchrow(
+                                        "SELECT object_key FROM admin.uploaded_files "
+                                        "WHERE uploaded_file_id = $1::uuid",
+                                        uploaded_file_id,
+                                    )
+                                object_key = row["object_key"] if row else ""
+                        except Exception:
+                            object_key = ""
+                        if not object_key:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "object_key or a valid uploaded_file_id is required"
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=400,
+                            )
+                            return
+                        options = {"ig_source": "upload", "object_key": object_key}
+                    else:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "source must be 'registry' or 'upload'"},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        job = await create_admin_job(
+                            pool,
+                            module_key="ig",
+                            job_type="ig_import",
+                            requested_by=admin_username,
+                            job_options=options,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps({"job": job}, ensure_ascii=False, default=str),
+                            status=201,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to start IG import",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                _ig_default_match = re.fullmatch(
+                    r"/admin/api/igs/([^/]+)/([^/]+)/default", path
+                )
+                if method == "POST" and _ig_default_match:
+                    import admin_ig
+
+                    pool = database.get_pool()
+                    ok = await admin_ig.set_default(
+                        pool,
+                        _ig_default_match.group(1),
+                        _ig_default_match.group(2),
+                    )
+                    await self._send_json(
+                        send,
+                        json.dumps({"ok": ok}, ensure_ascii=False),
+                        status=200 if ok else 404,
+                    )
+                    return
+
+                _ig_detail_match = re.fullmatch(r"/admin/api/igs/([^/]+)/([^/]+)", path)
+                if _ig_detail_match and method in ("GET", "DELETE"):
+                    import admin_ig
+
+                    pool = database.get_pool()
+                    pkg_id = _ig_detail_match.group(1)
+                    pkg_ver = _ig_detail_match.group(2)
+                    if method == "GET":
+                        detail = await admin_ig.get_ig_detail(pool, pkg_id, pkg_ver)
+                        if detail is None:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"error": "IG not found"}, ensure_ascii=False
+                                ),
+                                status=404,
+                            )
+                            return
+                        await self._send_json(
+                            send,
+                            json.dumps(detail, ensure_ascii=False, default=str),
+                        )
+                        return
+                    # DELETE
+                    result = await admin_ig.remove_ig(
+                        pool,
+                        pkg_id,
+                        pkg_ver,
+                        removed_by=admin_username,
+                        minio_service=minio_service,
+                    )
+                    await ws_broadcast("module_changed", {"module_key": "ig"})
+                    await self._send_json(
+                        send,
+                        json.dumps(result, ensure_ascii=False, default=str),
+                        status=200 if result.get("removed") else 404,
+                    )
+                    return
+
+                if method == "GET" and path == "/admin/api/settings":
+                    try:
+                        import admin_settings
+
+                        pool = database.get_pool()
+                        payload = await admin_settings.get_all(pool)
+                        await self._send_json(
+                            send, json.dumps(payload, ensure_ascii=False)
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load settings",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path.startswith("/admin/api/settings/"):
+                    import admin_settings
+
+                    rest = path[len("/admin/api/settings/") :]
+                    parts = rest.split("/")
+                    group = parts[0]
+                    action = parts[1] if len(parts) > 1 else ""
+                    try:
+                        body = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        if action == "models":
+                            result = await admin_settings.list_models(
+                                pool, group, body.get("values", {})
+                            )
+                            await self._send_json(
+                                send, json.dumps(result, ensure_ascii=False)
+                            )
+                        elif action == "test":
+                            result = await admin_settings.test_group(
+                                pool, group, body.get("values", {})
+                            )
+                            await self._send_json(
+                                send, json.dumps(result, ensure_ascii=False)
+                            )
+                        elif action == "":
+                            saved = await admin_settings.save_group(
+                                pool,
+                                group,
+                                body.get("values", {}),
+                                updated_by=admin_username,
+                            )
+                            await _refresh_settings_singletons(pool, group)
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"ok": True, "values": saved}, ensure_ascii=False
+                                ),
+                            )
+                        else:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"error": f"Unknown action '{action}'"},
+                                    ensure_ascii=False,
+                                ),
+                                status=404,
+                            )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Settings operation failed",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/services":
+                    try:
+                        pool = database.get_pool()
+                        payload = await list_service_probes(pool)
+                        await self._send_json(
+                            send,
+                            json.dumps(payload, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load cached service probes",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/services/probe":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    service_keys = payload.get("service_keys") or []
+                    if service_keys and not isinstance(service_keys, list):
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "service_keys must be an array when provided"
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        result = await run_service_probes(
+                            pool,
+                            minio_service=minio_service,
+                            service_keys=[str(key) for key in service_keys],
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(result, ensure_ascii=False),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to run active service probes",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/fhir-servers":
+                    try:
+                        query = _parse_query_params(scope)
+                        include_disabled = (
+                            str(query.get("include_disabled", "false") or "false")
+                            .strip()
+                            .lower()
+                            == "true"
+                        )
+                        pool = database.get_pool()
+                        servers = await list_registered_fhir_servers(
+                            pool,
+                            include_disabled=include_disabled,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"servers": servers}, ensure_ascii=False, default=str
+                            ),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to list FHIR servers",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/fhir-servers/export":
+                    try:
+                        pool = database.get_pool()
+                        servers = await export_fhir_servers(
+                            pool,
+                            secret_key=fhir_server_secret_key(
+                                config.admin_session_secret
+                            ),
+                            include_disabled=True,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"servers": servers}, ensure_ascii=False, default=str
+                            ),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to export FHIR servers",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/fhir-servers":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        server = await create_fhir_server(
+                            pool,
+                            payload,
+                            admin_user=admin_username,
+                            secret_key=fhir_server_secret_key(
+                                config.admin_session_secret
+                            ),
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"server": server}, ensure_ascii=False, default=str
+                            ),
+                            status=201,
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to create FHIR server",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/fhir-servers/generate-key":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        alg = str(payload.get("alg") or "").strip()
+                        result = generate_client_key(alg)
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": True, **result}, ensure_ascii=False, default=str
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": False, "error": str(exc)}, ensure_ascii=False
+                            ),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "ok": False,
+                                    "error": "Failed to generate keypair",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/fhir-servers/discover":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        result = await discover_fhir_metadata(payload)
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": True, **result}, ensure_ascii=False, default=str
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": False, "error": str(exc)}, ensure_ascii=False
+                            ),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        # Metadata unreachable/invalid — let the UI fall back to
+                        # manual scope entry rather than treating this as fatal.
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": False, "error": str(exc)}, ensure_ascii=False
+                            ),
+                            status=200,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/fhir-servers/test":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        result = await test_fhir_server_config(
+                            pool,
+                            payload,
+                            secret_key=fhir_server_secret_key(
+                                config.admin_session_secret
+                            ),
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(result, ensure_ascii=False, default=str),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "FHIR server connection test failed",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                _fhir_probe_match = re.fullmatch(
+                    r"/admin/api/fhir-servers/([^/]+)/probe", path
+                )
+                if method == "POST" and _fhir_probe_match:
+                    try:
+                        pool = database.get_pool()
+                        result = await probe_fhir_server(
+                            pool,
+                            _fhir_probe_match.group(1),
+                            secret_key=fhir_server_secret_key(
+                                config.admin_session_secret
+                            ),
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(result, ensure_ascii=False, default=str),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=404,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "FHIR server probe failed",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                _fhir_default_match = re.fullmatch(
+                    r"/admin/api/fhir-servers/([^/]+)/set-default", path
+                )
+                if method == "POST" and _fhir_default_match:
+                    try:
+                        pool = database.get_pool()
+                        server = await set_default_fhir_server(
+                            pool,
+                            _fhir_default_match.group(1),
+                            admin_user=admin_username,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"server": server}, ensure_ascii=False, default=str
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=404,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to set default FHIR server",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                _fhir_detail_match = re.fullmatch(
+                    r"/admin/api/fhir-servers/([^/]+)", path
+                )
+                if _fhir_detail_match:
+                    identifier = _fhir_detail_match.group(1)
+                    if method == "GET":
+                        try:
+                            pool = database.get_pool()
+                            server = await get_fhir_server(pool, identifier)
+                            if server is None:
+                                await self._send_json(
+                                    send,
+                                    json.dumps(
+                                        {"error": "FHIR server not found"},
+                                        ensure_ascii=False,
+                                    ),
+                                    status=404,
+                                )
+                            else:
+                                await self._send_json(
+                                    send,
+                                    json.dumps(
+                                        {"server": server},
+                                        ensure_ascii=False,
+                                        default=str,
+                                    ),
+                                )
+                        except Exception as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Failed to load FHIR server",
+                                        "detail": str(exc),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=500,
+                            )
+                        return
+
+                    if method == "PATCH":
+                        try:
+                            payload = await _read_json_body(receive)
+                        except Exception as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"error": "Invalid JSON body", "detail": str(exc)},
+                                    ensure_ascii=False,
+                                ),
+                                status=400,
+                            )
+                            return
+                        try:
+                            pool = database.get_pool()
+                            server = await update_fhir_server(
+                                pool,
+                                identifier,
+                                payload,
+                                admin_user=admin_username,
+                                secret_key=fhir_server_secret_key(
+                                    config.admin_session_secret
+                                ),
+                            )
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"server": server}, ensure_ascii=False, default=str
+                                ),
+                            )
+                        except ValueError as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps({"error": str(exc)}, ensure_ascii=False),
+                                status=400,
+                            )
+                        except Exception as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Failed to update FHIR server",
+                                        "detail": str(exc),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=500,
+                            )
+                        return
+
+                    if method == "DELETE":
+                        try:
+                            pool = database.get_pool()
+                            server = await delete_fhir_server(
+                                pool,
+                                identifier,
+                                admin_user=admin_username,
+                            )
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"deleted": server}, ensure_ascii=False, default=str
+                                ),
+                            )
+                        except ValueError as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps({"error": str(exc)}, ensure_ascii=False),
+                                status=404,
+                            )
+                        except Exception as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Failed to delete FHIR server",
+                                        "detail": str(exc),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=500,
+                            )
+                        return
+
+                if method == "GET" and path == "/admin/api/jobs":
+                    try:
+                        pool = database.get_pool()
+                        jobs = await list_admin_jobs(pool)
+                        await self._send_json(
+                            send,
+                            json.dumps({"jobs": jobs}, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to list admin jobs",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                job_detail_match = re.fullmatch(
+                    r"/admin/api/jobs/([0-9a-fA-F-]+)", path
+                )
+                if method == "GET" and job_detail_match:
+                    try:
+                        pool = database.get_pool()
+                        job = await get_admin_job(
+                            pool, job_id=job_detail_match.group(1)
+                        )
+                        if job is None:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"error": "Admin job not found"}, ensure_ascii=False
+                                ),
+                                status=404,
+                            )
+                        else:
+                            await self._send_json(
+                                send,
+                                json.dumps({"job": job}, ensure_ascii=False),
+                            )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load admin job",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                job_steps_match = re.fullmatch(
+                    r"/admin/api/jobs/([0-9a-fA-F-]+)/steps",
+                    path,
+                )
+                if method == "GET" and job_steps_match:
+                    try:
+                        pool = database.get_pool()
+                        steps = await list_job_steps(
+                            pool, job_id=job_steps_match.group(1)
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps({"steps": steps}, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load job steps",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                job_logs_match = re.fullmatch(
+                    r"/admin/api/jobs/([0-9a-fA-F-]+)/logs",
+                    path,
+                )
+                if method == "GET" and job_logs_match:
+                    try:
+                        pool = database.get_pool()
+                        qs = _parse_query_params(scope)
+                        log_limit = min(int(qs.get("limit", "100")), 500)
+                        before_id_str = qs.get("before_id")
+                        before_id = int(before_id_str) if before_id_str else None
+                        logs = await list_job_logs(
+                            pool,
+                            job_id=job_logs_match.group(1),
+                            limit=log_limit,
+                            before_id=before_id,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps({"logs": logs}, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load job logs",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/modules":
+                    try:
+                        pool = database.get_pool()
+                        modules = await list_source_catalog(pool)
+                        try:
+                            maintenance = await admin_maintenance.get_states(pool)
+                        except Exception:
+                            maintenance = {}
+                        record_counts = await _module_record_counts(pool)
+                        storage = {
+                            "minio_enabled": bool(
+                                minio_service and minio_service.enabled
+                            ),
+                            "bucket": (
+                                minio_service.config.bucket
+                                if minio_service is not None
+                                else ""
+                            ),
+                            "detail": (
+                                "MinIO ready"
+                                if minio_service is not None and minio_service.enabled
+                                else (
+                                    minio_service.init_error
+                                    if minio_service is not None
+                                    else "MinIO service not initialized"
+                                )
+                            ),
+                        }
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "modules": modules,
+                                    "upload_limits": {
+                                        "max_upload_mb": config.admin_max_upload_mb
+                                    },
+                                    "storage": storage,
+                                    "maintenance": maintenance,
+                                    "record_counts": record_counts,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to list module sources",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                _ds_versions_match = re.fullmatch(
+                    r"/admin/api/modules/([A-Za-z0-9_-]+)/versions", path
+                )
+                if method == "GET" and _ds_versions_match:
+                    ds_key = _ds_versions_match.group(1)
+                    try:
+                        pool = database.get_pool()
+                        versions = await list_source_versions(pool, ds_key)
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"module_key": ds_key, "versions": versions},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load version history",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                # ── Data preview (/admin/api/modules/{key}/preview) ─────────
+                _ds_preview_match = re.fullmatch(
+                    r"/admin/api/modules/([A-Za-z0-9_-]+)/preview", path
+                )
+                if method == "GET" and _ds_preview_match:
+                    ds_key = _ds_preview_match.group(1)
+                    if ds_key not in PREVIEW_SUPPORTED_MODULES:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": f"No preview available for '{ds_key}'"},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        query = _parse_query_params(scope)
+                        # Build kwargs from query parameters
+                        kwargs: dict = {}
+                        for k, v in query.items():
+                            if k in ("page", "per_page"):
+                                try:
+                                    kwargs[k] = max(1, int(v))
+                                except (ValueError, TypeError):
+                                    kwargs[k] = 1
+                            elif k == "id":
+                                try:
+                                    kwargs["id_"] = int(v)
+                                except (ValueError, TypeError):
+                                    pass
+                            elif k == "class":
+                                kwargs["class_"] = str(v)
+                            elif k == "property":
+                                kwargs["property_"] = str(v) if v else ""
+                            elif k == "node":
+                                kwargs["node"] = str(v) if v else None
+                            elif k in ("artifact_key", "value_set_url", "field_q"):
+                                if ds_key == "ig":
+                                    kwargs[k] = str(v) if v else ""
+                            elif k in (
+                                "q",
+                                "table",
+                                "category",
+                                "code_prefix",
+                                "code_from",
+                                "code_to",
+                                "zh_filter",
+                                "reference_filter",
+                                "component",
+                                "system",
+                                "property",
+                                "scale_type",
+                                "method_type",
+                                "specimen_type",
+                                "unit",
+                                "semantic_tag",
+                                "active",
+                                "language_code",
+                                "map_filter",
+                                "sort",
+                                "direction",
+                                "cs_id",
+                                "mode",
+                                "quality",
+                                "status",
+                                "class_",
+                                "resource_type",
+                                "grouping_id",
+                                "base_type",
+                                "element_source",
+                                "tty",
+                            ):
+                                kwargs[k] = str(v) if v else ""
+                        result = await dispatch_preview(pool, ds_key, kwargs)
+                        await self._send_json(
+                            send,
+                            json.dumps(result, ensure_ascii=False, default=str),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Preview failed", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                # ── Schedule CRUD (/admin/api/modules/{key}/schedule) ────────
+                _ds_schedule_match = re.fullmatch(
+                    r"/admin/api/modules/([A-Za-z0-9_-]+)/schedule", path
+                )
+                if _ds_schedule_match:
+                    ds_key = _ds_schedule_match.group(1)
+                    if ds_key not in SCHEDULABLE_MODULES:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": f"Module '{ds_key}' does not support scheduling"
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+
+                    if method == "GET":
+                        try:
+                            pool = database.get_pool()
+                            sched = await get_schedule(pool, ds_key)
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"schedule": sched.to_dict() if sched else None},
+                                    ensure_ascii=False,
+                                ),
+                            )
+                        except Exception as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Failed to load schedule",
+                                        "detail": str(exc),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=500,
+                            )
+                        return
+
+                    if method == "POST":
+                        try:
+                            body = await _read_json_body(receive)
+                            frequency = str(body.get("frequency", "")).strip()
+                            if frequency not in ("daily", "weekly", "monthly"):
+                                raise ValueError(
+                                    "frequency must be 'daily', 'weekly', or 'monthly'"
+                                )
+                            hour_utc = int(body.get("hour_utc", 2))
+                            minute_utc = int(body.get("minute_utc", 0))
+                            if not (0 <= hour_utc <= 23):
+                                raise ValueError("hour_utc must be 0-23")
+                            if not (0 <= minute_utc <= 59):
+                                raise ValueError("minute_utc must be 0-59")
+
+                            day_of_week = body.get("day_of_week")
+                            day_of_month = body.get("day_of_month")
+                            if frequency == "weekly":
+                                if day_of_week is None:
+                                    raise ValueError(
+                                        "day_of_week required for weekly frequency"
+                                    )
+                                day_of_week = int(day_of_week)
+                                if not (0 <= day_of_week <= 6):
+                                    raise ValueError(
+                                        "day_of_week must be 0 (Mon) to 6 (Sun)"
+                                    )
+                            elif frequency == "monthly":
+                                if day_of_month is None:
+                                    raise ValueError(
+                                        "day_of_month required for monthly frequency"
+                                    )
+                                day_of_month = int(day_of_month)
+                                if not (1 <= day_of_month <= 28):
+                                    raise ValueError("day_of_month must be 1-28")
+
+                            fetch_url = str(body.get("fetch_url") or "").strip() or None
+                            source_role = (
+                                str(body.get("source_role") or "").strip() or None
+                            )
+                            is_enabled = bool(body.get("is_enabled", True))
+
+                            if ds_key in URL_FETCH_MODULES:
+                                if not fetch_url:
+                                    raise ValueError(
+                                        f"fetch_url is required for '{ds_key}' schedules"
+                                    )
+                                if not fetch_url.lower().startswith("https://"):
+                                    raise ValueError("fetch_url must use HTTPS")
+                                if not source_role:
+                                    raise ValueError(
+                                        f"source_role is required for '{ds_key}' schedules"
+                                    )
+
+                            pool = database.get_pool()
+                            username = _admin_username_from_scope(scope) or "admin"
+                            sched = await upsert_schedule(
+                                pool,
+                                module_key=ds_key,
+                                source_role=source_role,
+                                fetch_url=fetch_url,
+                                frequency=frequency,
+                                day_of_week=(
+                                    day_of_week if frequency == "weekly" else None
+                                ),
+                                day_of_month=(
+                                    day_of_month if frequency == "monthly" else None
+                                ),
+                                hour_utc=hour_utc,
+                                minute_utc=minute_utc,
+                                is_enabled=is_enabled,
+                                created_by=username,
+                            )
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"schedule": sched.to_dict()},
+                                    ensure_ascii=False,
+                                ),
+                            )
+                        except (ValueError, TypeError) as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps({"error": str(exc)}, ensure_ascii=False),
+                                status=400,
+                            )
+                        except Exception as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Failed to save schedule",
+                                        "detail": str(exc),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=500,
+                            )
+                        return
+
+                    if method == "DELETE":
+                        try:
+                            pool = database.get_pool()
+                            deleted = await delete_schedule(pool, ds_key)
+                            await self._send_json(
+                                send,
+                                json.dumps({"deleted": deleted}, ensure_ascii=False),
+                            )
+                        except Exception as exc:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Failed to delete schedule",
+                                        "detail": str(exc),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=500,
+                            )
+                        return
+
+                # ── Schedule: immediate trigger (/admin/api/modules/{key}/schedule/trigger)
+                _ds_sched_trigger_match = re.fullmatch(
+                    r"/admin/api/modules/([A-Za-z0-9_-]+)/schedule/trigger", path
+                )
+                if method == "POST" and _ds_sched_trigger_match:
+                    ds_key = _ds_sched_trigger_match.group(1)
+                    if ds_key not in SCHEDULABLE_MODULES:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": f"Module '{ds_key}' does not support scheduling"
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        sched = await get_schedule(pool, ds_key)
+                        if sched is None:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {"error": "No schedule configured for this module"},
+                                    ensure_ascii=False,
+                                ),
+                                status=404,
+                            )
+                            return
+                        username = _admin_username_from_scope(scope) or "admin"
+                        # Fire in a background task so large downloads don't block HTTP response
+                        asyncio.create_task(
+                            fire_schedule(
+                                pool,
+                                schedule=sched,
+                                minio_service=minio_service,
+                                triggered_by=f"manual:{username}",
+                            )
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "triggered": True,
+                                    "message": "Schedule trigger initiated. Check the Tasks tab for progress.",
+                                    "module_key": ds_key,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to trigger schedule",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/drug/status":
+                    query = _parse_query_params(scope)
+                    try:
+                        page = max(1, int(str(query.get("page", "1") or "1")))
+                    except ValueError:
+                        page = 1
+                    try:
+                        per_page = max(
+                            1, min(200, int(str(query.get("per_page", "50") or "50")))
+                        )
+                    except ValueError:
+                        per_page = 50
+                    q = str(query.get("q", "") or "").strip()
+                    active_only = (
+                        str(query.get("active_only", "true") or "true").strip().lower()
+                        == "true"
+                    )
+                    failed_only = (
+                        str(query.get("failed_only", "false") or "false")
+                        .strip()
+                        .lower()
+                        == "true"
+                    )
+                    try:
+                        pool = database.get_pool()
+                        payload = await get_drug_admin_status(
+                            pool,
+                            page=page,
+                            per_page=per_page,
+                            q=q,
+                            active_only=active_only,
+                            failed_only=failed_only,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(payload, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load drug admin status",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/drug/pipeline-status":
+                    try:
+                        pool = database.get_pool()
+                        payload = await get_drug_pipeline_status(pool)
+                        await self._send_json(
+                            send,
+                            json.dumps(payload, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load drug pipeline status",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/drug/events":
+                    query = _parse_query_params(scope)
+                    license_id = str(query.get("license_id", "") or "").strip()
+                    if not license_id:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "license_id is required"}, ensure_ascii=False
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        events = await get_drug_license_events(pool, license_id)
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"license_id": license_id, "events": events},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load drug events",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/drug/details":
+                    query = _parse_query_params(scope)
+                    license_id = str(query.get("license_id", "") or "").strip()
+                    include_cancelled = (
+                        str(query.get("include_cancelled", "true") or "true")
+                        .strip()
+                        .lower()
+                        == "true"
+                    )
+                    if not license_id:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "license_id is required"}, ensure_ascii=False
+                            ),
+                            status=400,
+                        )
+                        return
+                    if drug_service is None:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Drug service not available"},
+                                ensure_ascii=False,
+                            ),
+                            status=503,
+                        )
+                        return
+                    try:
+                        payload = await drug_service.get_drug_details(
+                            license_id,
+                            include_cancelled=include_cancelled,
+                        )
+                        await self._send_json(send, payload)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load drug details",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/drug/assets":
+                    query = _parse_query_params(scope)
+                    license_id = str(query.get("license_id", "") or "").strip()
+                    asset_group = (
+                        str(query.get("asset_group", "") or "").strip() or None
+                    )
+                    if not license_id:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "license_id is required"}, ensure_ascii=False
+                            ),
+                            status=400,
+                        )
+                        return
+                    if drug_service is None:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Drug service not available"},
+                                ensure_ascii=False,
+                            ),
+                            status=503,
+                        )
+                        return
+                    try:
+                        payload = await drug_service.get_drug_asset_links(
+                            license_id=license_id,
+                            asset_group=asset_group,
+                        )
+                        await self._send_json(send, payload)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load drug assets",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/drug/asset-content":
+                    # Same-origin proxy that streams a single asset's bytes from
+                    # MinIO for inline preview (PDF iframe / JSON / Markdown).
+                    query = _parse_query_params(scope)
+                    asset_id = str(query.get("asset_id", "") or "").strip()
+                    if not asset_id:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "asset_id is required"}, ensure_ascii=False
+                            ),
+                            status=400,
+                        )
+                        return
+                    if drug_service is None:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Drug service not available"},
+                                ensure_ascii=False,
+                            ),
+                            status=503,
+                        )
+                        return
+                    try:
+                        result = await drug_service.get_drug_asset_content(asset_id)
+                        if result is None:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Asset not found or has no stored content"
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=404,
+                            )
+                            return
+                        data, mime_type, _filename = result
+                        await self._send_file(
+                            send,
+                            data,
+                            (mime_type or "application/octet-stream").encode("utf-8"),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load asset content",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/embedding/status":
+                    try:
+                        pool = database.get_pool()
+                        payload = await get_embedding_status(pool)
+                        await self._send_json(
+                            send,
+                            json.dumps(payload, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to load embedding status",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "GET" and path == "/admin/api/workers":
+                    try:
+                        pool = database.get_pool()
+                        workers = await list_worker_heartbeats(pool)
+                        await self._send_json(
+                            send,
+                            json.dumps({"workers": workers}, ensure_ascii=False),
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to list worker heartbeats",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/uploads":
+                    query = _parse_query_params(scope)
+                    module_key = str(query.get("module_key", "") or "").strip()
+                    source_role = str(query.get("source_role", "") or "").strip()
+                    original_filename = str(query.get("filename", "") or "").strip()
+                    auto_activate = (
+                        str(query.get("auto_activate", "false")).strip().lower()
+                        == "true"
+                    )
+                    raw_body = await self._read_body(receive)
+                    max_upload_bytes = max(config.admin_max_upload_mb, 1) * 1024 * 1024
+                    if not module_key or not source_role or not original_filename:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Missing upload metadata",
+                                    "required": [
+                                        "module_key",
+                                        "source_role",
+                                        "filename",
+                                    ],
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    if not raw_body:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Upload body is empty"},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    if len(raw_body) > max_upload_bytes:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Upload exceeds max size",
+                                    "max_upload_mb": config.admin_max_upload_mb,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=413,
+                        )
+                        return
+                    # ── Magika content-type validation ────────────────────────
+                    try:
+                        _entry = catalog_entry(module_key, source_role)
+                        validate_source_filename(original_filename, _entry)
+                        await validate_source_content(raw_body, _entry)
+                    except ValueError as _ve:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(_ve)}, ensure_ascii=False),
+                            status=415,
+                        )
+                        return
+                    # ─────────────────────────────────────────────────────────
+                    try:
+                        pool = database.get_pool()
+                        result = await create_uploaded_source(
+                            pool,
+                            minio_service=minio_service,
+                            module_key=module_key,
+                            source_role=source_role,
+                            original_filename=original_filename,
+                            mime_type=(
+                                _header_value(scope, "content-type")
+                                or "application/octet-stream"
+                            ),
+                            data=raw_body,
+                            uploaded_by=admin_username,
+                            auto_activate=auto_activate,
+                        )
+                        if result.get("duplicate"):
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "message": "Duplicate upload skipped; existing source reused",
+                                        "duplicate": True,
+                                        "uploaded_file": result["uploaded_file"],
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=200,
+                            )
+                        else:
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "duplicate": False,
+                                        "uploaded_file": result["uploaded_file"],
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=201,
+                            )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                    except RuntimeError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=503,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to persist uploaded source",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/module-sources/activate":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    uploaded_file_id = str(
+                        payload.get("uploaded_file_id", "") or ""
+                    ).strip()
+                    if not uploaded_file_id:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "uploaded_file_id is required"},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        module_source = await activate_source(
+                            pool,
+                            uploaded_file_id=uploaded_file_id,
+                            activated_by=admin_username,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"module_source": module_source},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=404,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to activate module source",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/module-sources/deactivate":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    uploaded_file_id = str(
+                        payload.get("uploaded_file_id", "") or ""
+                    ).strip()
+                    if not uploaded_file_id:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "uploaded_file_id is required"},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        source = await deactivate_source(
+                            pool,
+                            uploaded_file_id=uploaded_file_id,
+                            deactivated_by=admin_username,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": True, "source": source}, ensure_ascii=False
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to deactivate module source",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/module-sources/delete":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    uploaded_file_id = str(
+                        payload.get("uploaded_file_id", "") or ""
+                    ).strip()
+                    if not uploaded_file_id:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "uploaded_file_id is required"},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        result = await delete_uploaded_source(
+                            pool,
+                            uploaded_file_id=uploaded_file_id,
+                            deleted_by=admin_username,
+                            minio_service=minio_service,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": True, "deleted": result}, ensure_ascii=False
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to delete module source",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                # ── Maintenance mode toggle ──────────────────────────────────
+                if method == "POST" and path == "/admin/api/module-maintenance":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    ds_key = str(payload.get("module_key", "") or "").strip()
+                    enabled = bool(payload.get("enabled", False))
+                    try:
+                        pool = database.get_pool()
+                        new_state = await admin_maintenance.set_enabled(
+                            pool, ds_key, enabled, updated_by=admin_username
+                        )
+                        await ws_broadcast(
+                            "maintenance_changed",
+                            {"module_key": ds_key, "enabled": new_state},
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "ok": True,
+                                    "module_key": ds_key,
+                                    "enabled": new_state,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to set maintenance mode",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                # ── Destructive clear-and-reset (maintenance only) ───────────
+                _ds_clear_match = re.fullmatch(
+                    r"/admin/api/modules/([A-Za-z0-9_-]+)/clear", path
+                )
+                if method == "POST" and _ds_clear_match:
+                    ds_key = _ds_clear_match.group(1)
+                    if ds_key not in {
+                        "drug",
+                        "icd",
+                        "loinc",
+                        "snomed",
+                        "ig",
+                        "rxnorm",
+                    }:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": f"Clear is not supported for '{ds_key}'"},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        if not await admin_maintenance.is_enabled(pool, ds_key):
+                            await self._send_json(
+                                send,
+                                json.dumps(
+                                    {
+                                        "error": "Enable maintenance mode before clearing this module",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                status=409,
+                            )
+                            return
+                        if ds_key == "icd":
+                            result = await clear_icd_module(
+                                pool,
+                                cleared_by=admin_username,
+                                minio_service=minio_service,
+                            )
+                        elif ds_key == "loinc":
+                            result = await clear_loinc_module(
+                                pool,
+                                cleared_by=admin_username,
+                                minio_service=minio_service,
+                            )
+                        elif ds_key == "snomed":
+                            result = await clear_snomed_module(
+                                pool,
+                                cleared_by=admin_username,
+                                minio_service=minio_service,
+                            )
+                        elif ds_key == "ig":
+                            result = await clear_ig_module(
+                                pool,
+                                cleared_by=admin_username,
+                                minio_service=minio_service,
+                            )
+                        elif ds_key == "rxnorm":
+                            result = await clear_rxnorm_module(
+                                pool,
+                                cleared_by=admin_username,
+                                minio_service=minio_service,
+                            )
+                        else:
+                            result = await clear_drug_module(
+                                pool,
+                                cleared_by=admin_username,
+                                minio_service=minio_service,
+                            )
+                        await ws_broadcast("module_cleared", {"module_key": ds_key})
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"ok": True, "cleared": result}, ensure_ascii=False
+                            ),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to clear module",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=409,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to clear module",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                if method == "POST" and path == "/admin/api/jobs":
+                    try:
+                        payload = await _read_json_body(receive)
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": "Invalid JSON body", "detail": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    job_type = str(payload.get("job_type", "") or "").strip()
+                    module_key = str(
+                        payload.get("module_key", "admin") or "admin"
+                    ).strip()
+                    if job_type not in ADMIN_JOB_TYPES:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Unsupported admin job type",
+                                    "allowed_job_types": sorted(ADMIN_JOB_TYPES),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                        return
+                    try:
+                        pool = database.get_pool()
+                        job = await create_admin_job(
+                            pool,
+                            module_key=module_key,
+                            job_type=job_type,
+                            requested_by=admin_username,
+                            job_options=payload.get("job_options") or {},
+                            source_module_source_id=str(
+                                payload.get("source_module_source_id", "") or ""
+                            ).strip(),
+                            source_uploaded_file_id=str(
+                                payload.get("source_uploaded_file_id", "") or ""
+                            ).strip(),
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps({"job": job}, ensure_ascii=False),
+                            status=201,
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {"error": str(exc)},
+                                ensure_ascii=False,
+                            ),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to create admin job",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                job_control_match = re.fullmatch(
+                    r"/admin/api/jobs/([0-9a-fA-F-]+)/(pause|resume|stop|restart)",
+                    path,
+                )
+                if method == "POST" and job_control_match:
+                    try:
+                        pool = database.get_pool()
+                        result = await request_job_control(
+                            pool,
+                            job_id=job_control_match.group(1),
+                            action=job_control_match.group(2),
+                            requested_by=admin_username,
+                        )
+                        await self._send_json(
+                            send,
+                            json.dumps(result, ensure_ascii=False),
+                        )
+                    except ValueError as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            status=400,
+                        )
+                    except Exception as exc:
+                        await self._send_json(
+                            send,
+                            json.dumps(
+                                {
+                                    "error": "Failed to apply job control",
+                                    "detail": str(exc),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            status=500,
+                        )
+                    return
+
+                await self._send_404(send)
+                return
 
             # ── static HTML pages ──────────────────────────────────────────
             if method == "GET":
@@ -2575,7 +6154,7 @@ _READ_ONLY = ToolAnnotations(readOnlyHint=True)
 @mcp.tool(annotations=_READ_ONLY)
 async def health_check() -> str:
     """
-    Return runtime readiness of the MCP server and every dataset-backed service.
+    Return runtime readiness of the MCP server and every module-backed service.
 
     Call this first before any workflow to confirm the required services are online.
     Returns a lightweight JSON object — no expensive queries are run.
@@ -2588,8 +6167,9 @@ async def health_check() -> str:
     - `services`: object with one boolean flag per service group:
       - `icd` — ICD-10-CM/PCS codes (search_medical_codes, infer_complications,
         get_nearby_codes, check_medical_conflict, browse_icd_category)
-      - `drug` — Taiwan FDA drugs (search_drug, identify_unknown_pill)
-      - `health_supplement` — Taiwan FDA health foods (search_health_supplement)
+      - `drug` — Taiwan FDA drug data (search_drug, identify_unknown_pill,
+        get_drug_details, get_drug_asset_links)
+      - `health_supplements` — Taiwan FDA health supplements (search_health_supplements)
       - `food_nutrition` — Taiwan FDA food composition
         (query_food_nutrition, query_food_ingredient,
          search_foods_by_nutrient, analyze_meal_nutrition)
@@ -2601,11 +6181,14 @@ async def health_check() -> str:
         batch_interpret_lab_results)
       - `guideline` — Taiwan clinical guidelines (search_clinical_guideline,
         query_guideline)
-      - `twcore` — TWCore IG CodeSystems (query_twcore_code)
+      - `ig` — FHIR IG authoring toolset (multi-IG discovery, StructureDefinition,
+        terminology, reference/bundle, validation, schema-guided fill — the `fhir_*`
+        tools, e.g. fhir_list_igs, fhir_get_profile_elements, fhir_normalize_code,
+        fhir_validate_resource, fhir_finalize_resource)
       - `snomed` — SNOMED CT concepts (search_snomed_concept, query_snomed_concept,
         get_snomed_relationships, query_snomed_mapping)
 
-    A `false` flag means the dataset was not loaded or the service failed to
+    A `false` flag means the module was not loaded or the service failed to
     initialize; those tools will return a service-unavailable error until the
     underlying data is populated and the service restarted.
     """
@@ -2630,22 +6213,258 @@ async def health_check() -> str:
         {
             "status": "ok" if db_ok else "degraded",
             "database": "ok" if db_ok else "error",
+            "db_health": db_health.monitor().snapshot(),
             "cache": "ok" if cache_ok else "error",
             "services": {
                 "icd": icd_service is not None,
                 "drug": drug_service is not None,
-                "health_supplement": health_food_service is not None,
+                "health_supplements": health_supplements_service is not None,
                 "food_nutrition": food_nutrition_service is not None,
                 "fhir_condition": fhir_condition_service is not None,
                 "fhir_medication": fhir_medication_service is not None,
                 "lab": lab_service is not None,
                 "guideline": guideline_service is not None,
-                "twcore": twcore_service is not None,
+                "ig": fhir_ig_service is not None,
                 "snomed": snomed_service is not None,
             },
         },
         ensure_ascii=False,
     )
+
+
+# ============================================================
+# Group 0B: External FHIR Servers
+# ============================================================
+
+
+@mcp.tool(annotations=_READ_ONLY)
+@audited("list_fhir_servers")
+async def list_fhir_servers(include_disabled: bool = False) -> str:
+    """
+    List admin-configured external FHIR servers available for MCP workflows.
+
+    This is the discovery entry point: call it first to see which servers exist,
+    what they allow, and whether they are healthy, then call `crud_fhir_server`
+    to actually read/search/write. Returns `{count, servers: [...]}`.
+
+    Each server object — identical in shape to `get_fhir_server_status` — has:
+
+    Identity & state
+    - `server_key`: stable id. Pass THIS (not the name) to `crud_fhir_server` and
+      `get_fhir_server_status`.
+    - `name`: human-friendly label; use it when talking to the user.
+    - `description`: admin's free-text note on the server's purpose.
+    - `base_url`: the FHIR R4 REST base. Informational only — you never pass URLs
+      to tools; paths are built from operation/resource_type/resource_id.
+    - `enabled`: if false, the server is administratively off and
+      `crud_fhir_server` will refuse it — don't try to call it.
+    - `default`: true means this server answers `server_key="default"`.
+
+    Capabilities (what you may call)
+    - `allowed_resource_types`: FHIR types you may target (e.g. Patient,
+      Observation). If non-empty, any other type is rejected. Empty = no limit.
+    - `allowed_operations`: permitted ops (metadata/read/search/create/update/
+      patch/delete). A disallowed op fails. Write ops also need
+      `confirm_write=true` on `crud_fhir_server`.
+    - `fhir_version`: server's FHIR version from its CapabilityStatement (e.g.
+      "4.0.1"); empty if not probed yet.
+    - `supported_resources`: resource types the server advertised it supports;
+      use to know what is actually queryable. May be empty if not probed.
+
+    Auth (informational — the MCP server handles tokens for you; you never see or
+    send tokens yourself)
+    - `auth.required`: whether the server needs OAuth at all (false = calls go
+      out unauthenticated).
+    - `auth.type`: "none" or "oauth2_client_credentials".
+    - `auth.profile`: "none" / "iua" / "smart" — the OAuth flavor.
+    - `auth.token_auth_method`: how the client authenticates to the token
+      endpoint (client_secret_basic/post/jwt, private_key_jwt). OAuth only.
+    - `auth.token_strategy_default`: the server's default token handling —
+      "fresh" (new token every call) or "cached" (reuse until expiry). You may
+      override it per call via `crud_fhir_server`'s `token_strategy` argument.
+    - `auth.uses_metadata`: whether the token endpoint is auto-discovered.
+    - `auth.scopes`: OAuth scopes requested (the granted access level).
+
+    Health
+    - `test_path`: a path the ADMIN uses to health-check the server; not used by
+      your calls. Informational.
+    - `probe`: the last STORED connectivity check (not live):
+      - `probe.status`: "ok" / "error" / "unknown" (never probed).
+      - `probe.ok`: convenience boolean.
+      - `probe.checked_at`: ISO timestamp of that probe, or null.
+      - `probe.error`: short message if it failed.
+      Act on it: if `probe.ok` is false (or status "error"/"unknown"), the server
+      may be unreachable/misconfigured — warn the user, or try a `metadata`
+      operation first, before relying on it for clinical data.
+
+    Secrets (client secret, private key, JWK), client_id, and token endpoint URLs
+    are never returned. For one server, use `get_fhir_server_status`.
+
+    Args:
+        include_disabled: Include disabled server records (enabled=false) too.
+            Defaults to false (only callable servers).
+    """
+    try:
+        pool = database.get_pool()
+        servers = await list_registered_fhir_servers(
+            pool,
+            include_disabled=include_disabled,
+        )
+        safe_servers = [server_mcp_summary(server) for server in servers]
+        return json.dumps(
+            {"count": len(safe_servers), "servers": safe_servers},
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    except Exception as exc:
+        return _json_error("Failed to list FHIR servers", detail=str(exc))
+
+
+@mcp.tool()
+@audited("get_fhir_server_status")
+async def get_fhir_server_status(server_key: str) -> str:
+    """
+    Get the status and configuration of ONE admin-configured external FHIR server.
+
+    Returns a single server object with the SAME fields as `list_fhir_servers`
+    (see that tool for the full meaning of every field: `server_key`, `name`,
+    `base_url`, `enabled`, `default`, `allowed_resource_types`,
+    `allowed_operations`, `fhir_version`, `supported_resources`, the `auth`
+    block, `test_path`, and the `probe` block).
+
+    Typical use — call this right before `crud_fhir_server` to:
+    - confirm `enabled` is true (else the call will be refused);
+    - check `probe.ok` — if false/"unknown", warn the user or run a `metadata`
+      operation first instead of trusting it for clinical data;
+    - read `allowed_operations` / `allowed_resource_types` so you only attempt
+      permitted calls (and remember writes need `confirm_write=true`);
+    - see `auth.required` (whether OAuth is in play — handled for you) and
+      `auth.token_strategy_default` (so you know the default, and can override it
+      with `crud_fhir_server`'s `token_strategy` when you need fresh vs cached).
+
+    The `probe` is the LAST STORED result of an admin/scheduled probe — this tool
+    does NOT make a live call to the FHIR server, so it is cheap and safe to call.
+    Secrets, client_id, and token endpoint URLs are never returned.
+
+    Args:
+        server_key: Admin-defined server key, UUID, name, or `"default"` for the
+            default server. Prefer the `server_key` value from `list_fhir_servers`.
+    """
+    try:
+        pool = database.get_pool()
+        server = await get_fhir_server(pool, server_key)
+        if not server:
+            return _json_error(
+                "FHIR server not found",
+                detail=f"No server matches '{server_key}'.",
+            )
+        return json.dumps(
+            server_mcp_summary(server),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    except Exception as exc:
+        return _json_error("Failed to get FHIR server status", detail=str(exc))
+
+
+@mcp.tool()
+@audited("crud_fhir_server")
+async def crud_fhir_server(
+    server_key: str,
+    operation: Literal[
+        "metadata", "read", "search", "create", "update", "patch", "delete"
+    ] = "metadata",
+    resource_type: str = "",
+    resource_id: str = "",
+    query_json: str = "",
+    resource_json: str = "",
+    patch_json: str = "",
+    confirm_write: bool = False,
+    token_strategy: Literal["auto", "fresh", "cached"] = "auto",
+) -> str:
+    """
+    Perform a controlled FHIR REST operation against an admin-configured server.
+
+    The server must already exist in Admin -> Modules -> FHIR Servers. This tool
+    never accepts arbitrary URLs; it only builds standard FHIR REST paths from
+    `operation`, `resource_type`, and `resource_id`.
+
+    Before calling, use `list_fhir_servers` (or `get_fhir_server_status`) to pick a
+    `server_key` and verify the server is `enabled`, its `probe.ok` is true, and
+    your `operation`/`resource_type` are within its `allowed_operations` /
+    `allowed_resource_types`. Authentication is handled for you — you never send
+    tokens; the server's `auth` settings decide that automatically.
+
+    Operations:
+    - `metadata`: GET /metadata
+    - `read`: GET /{ResourceType}/{id}
+    - `search`: GET /{ResourceType}?...
+    - `create`: POST /{ResourceType}
+    - `update`: PUT /{ResourceType}/{id}
+    - `patch`: PATCH /{ResourceType}/{id}
+    - `delete`: DELETE /{ResourceType}/{id}
+
+    Write operations require both admin-side permission on the selected server
+    and `confirm_write=true` in this tool call.
+
+    Args:
+        server_key: Admin-defined server key, UUID, name, or `"default"`.
+        operation: FHIR REST operation.
+        resource_type: FHIR resource type, e.g. `"Patient"` or `"Observation"`.
+        resource_id: FHIR logical id for read/update/patch/delete.
+        query_json: For search, JSON object or query string, e.g. `{"name":"Wang"}`.
+        resource_json: JSON resource body for create/update.
+        patch_json: JSON Patch array or FHIR patch body for patch.
+        confirm_write: Must be true for create/update/patch/delete.
+        token_strategy: OAuth token handling for servers that use OAuth2.
+            - `auto` (default): follow the server's admin-configured default
+              (which itself defaults to `fresh`).
+            - `fresh`: acquire a brand-new access token for this call (full
+              re-authentication; most isolated, adds one token round-trip).
+            - `cached`: reuse a shared per-server token until it expires (faster
+              for many calls in a row). The token represents this server's client
+              identity and is shared across all users, never a single user.
+
+    Returns a JSON object describing the HTTP result:
+    - `ok`: true when the FHIR server returned 2xx.
+    - `status_code` / `reason`: the HTTP status (e.g. 200, 404) and reason phrase.
+    - `method` / `url`: the actual request issued (for transparency/debugging).
+    - `json`: the parsed FHIR response body (a resource or a Bundle for `search`),
+      when the response was JSON. For a failed call this is usually an
+      OperationOutcome explaining why.
+    - `text`: raw body instead of `json` when the response was not JSON or was
+      too large (`truncated: true`).
+    - `duration_ms`: round-trip time.
+    - `explanation`: a hint for common auth failures (401/403).
+    - `token_strategy`: the strategy actually used (`fresh`/`cached`) after
+      resolving `auto` against the server default.
+    On a 4xx/5xx, read `status_code` + the OperationOutcome in `json`/`text` to
+    explain the failure to the user rather than retrying blindly.
+    """
+    try:
+        pool = database.get_pool()
+        secret_key = fhir_server_secret_key(config.admin_session_secret)
+        result = await perform_fhir_crud(
+            pool,
+            server_key=server_key,
+            operation=operation,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            query=query_json,
+            resource=resource_json,
+            patch=patch_json,
+            confirm_write=confirm_write,
+            secret_key=secret_key,
+            caller="mcp",
+            token_strategy=token_strategy,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except ValueError as exc:
+        return _json_error(str(exc))
+    except Exception as exc:
+        return _json_error("FHIR CRUD request failed", detail=str(exc))
 
 
 # ============================================================
@@ -2690,6 +6509,8 @@ async def search_medical_codes(
         limit: Results per type (default 3, max 10). Applies independently to
                both diagnoses and procedures when `type="all"`.
     """
+    if await _icd_maintenance_active():
+        return _svc_maintenance("ICD")
     if icd_service is None:
         return _svc_unavailable("ICD Service")
     return await icd_service.search_codes(keyword, type, limit=limit)
@@ -2714,13 +6535,15 @@ async def infer_complications(code: str) -> str:
     Output shape:
     - parent result: `{"base_code", "potential_complications_or_specifics": [...]}`
     - leaf result: `{"message", "related_codes": [...]}`
-    Each item: `{code, name_zh}`.
+    Each item: `{code, name_zh, name_en}`.
 
     Args:
         code: ICD-10-CM code or category prefix, e.g. `"E11"` (type 2 diabetes),
               `"E11.9"` (leaf), `"N18"` (CKD), `"N80"` (endometriosis),
               `"I10"` (essential hypertension). Case-insensitive.
     """
+    if await _icd_maintenance_active():
+        return _svc_maintenance("ICD")
     if icd_service is None:
         return _svc_unavailable("ICD Service")
     return await icd_service.infer_complications(code)
@@ -2736,7 +6559,7 @@ async def get_nearby_codes(code: str) -> str:
     These are ordering neighbors, not semantic matches. Use this for coder review
     workflows or "did-you-mean adjacent code" UX before final coding.
 
-    Output shape: `{"target", "nearby_options": [{code, name_zh, rel}, ...]}`
+    Output shape: `{"target", "nearby_options": [{code, name_zh, name_en, rel}, ...]}`
     where `rel` is `"prev"` or `"next"`.
     Results are sorted by code alphabetically.
 
@@ -2747,6 +6570,8 @@ async def get_nearby_codes(code: str) -> str:
         code: ICD-10-CM diagnosis code, e.g. `"E11.9"`, `"I10"`, `"N18.4"`.
               Case-insensitive (normalized to uppercase internally).
     """
+    if await _icd_maintenance_active():
+        return _svc_maintenance("ICD")
     if icd_service is None:
         return _svc_unavailable("ICD Service")
     return await icd_service.get_nearby_codes(code)
@@ -2781,6 +6606,8 @@ async def check_medical_conflict(diagnosis_code: str, procedure_code: str) -> st
         procedure_code: ICD-10-PCS code, e.g. `"0DTJ0ZZ"`, `"0FB04ZX"`.
                         Requires ICD-10-PCS data to be loaded (see health_check).
     """
+    if await _icd_maintenance_active():
+        return _svc_maintenance("ICD")
     if icd_service is None:
         return _svc_unavailable("ICD Service")
     return await icd_service.get_conflict_info(diagnosis_code, procedure_code)
@@ -2816,347 +6643,202 @@ async def browse_icd_category(category: str | None = None, limit: int = 50) -> s
         limit: Maximum codes returned for a single category (default 50, cap 200).
                Ignored when `category` is omitted.
     """
+    if await _icd_maintenance_active():
+        return _svc_maintenance("ICD")
     if icd_service is None:
         return _svc_unavailable("ICD Service")
     return await icd_service.browse_category(category, limit)
 
 
 # ============================================================
-# Group 2: Drug (Taiwan FDA)
+# Group 2: Drug (Taiwan FDA index-first, Phase 1)
 # ============================================================
 
 
 @audited("search_drug")
 async def search_drug(
-    mode: Literal[
-        "drug_name",
-        "atc_code",
-        "ingredient",
-        "license_id",
-        "rxnorm_resolve",
-        "rxnorm_ingredients",
-        "interaction",
-    ] = "drug_name",
+    mode: Literal["drug_name", "ingredient", "license_id", "atc_code"] = "drug_name",
     keyword: str = "",
-    drug_names: list[str] | None = None,
     limit: int = 3,
+    include_cancelled: bool = False,
 ) -> str:
     """
-    Unified drug endpoint for Taiwan FDA product search + RxNorm terminology queries.
+    Search Taiwan FDA drug records from the canonical drug domain module.
 
-    Mode reference:
-    - `drug_name` (default): search Taiwan FDA drug database by trade name or
-      indication text. Uses hybrid BM25 + semantic embedding re-ranking.
-      Example: keyword `"降血壓"` or `"metformin"`.
-    - `atc_code`: filter Taiwan FDA drugs by ATC code prefix (letter+digit pattern
-      only, no embedding). Input must match `[A-Za-z][A-Za-z0-9]{0,6}`.
-      Examples: `"A10"`, `"A10BA02"`, `"C09"`.
-    - `ingredient`: search by active ingredient (INN) name. Hybrid BM25 + embedding.
-      Examples: `"metformin"`, `"lisinopril"`, `"阿斯匹靈"`.
-    - `license_id`: exact Taiwan FDA license lookup by license number.
-      Accepts full license (e.g. `"衛署藥製字第000029號"`) or bare digits (`"000029"`).
-    - `rxnorm_resolve`: resolve a free-text drug name to RxNorm RXCUI concepts.
-      Returns IN/PIN/BN concept matches. Example: keyword `"aspirin"`.
-    - `rxnorm_ingredients`: retrieve ingredient composition for a drug given its
-      RXCUI. Pass the RXCUI as `keyword`, e.g. `"1191"` (aspirin).
-    - `interaction`: check pairwise drug–drug interactions via RxNorm. Does not
-      use `keyword` — pass at least 2 names via `drug_names`.
+    The search surface starts from the canonical `36_2.csv` index and is
+    enriched in later phases with TFDA electronic inserts, document assets, and
+    appearance data. Search is available for drug names, ingredient text,
+    license identifiers, and ATC rows.
 
-    Unified response shape (all modes):
-    ```
-    {"mode", "keyword", "results": [...]}
-    ```
-    Every item in `results` always contains the same canonical keys:
-    - `license_id`, `name_zh`, `name_en`, `indication`, `usage`, `form`,
-      `package`, `category`, `manufacturer`, `valid_date`, `appearance`,
-      `insert_url` — Taiwan FDA fields (null/empty for RxNorm-only results)
-    - `ingredients`: `[{ingredient_name, ingredient_qty, ingredient_unit,
-      rxcui, tty}]`
-    - `atc`: `[{atc_code, atc_name}]` (from FDA record or mapped from RXCUI)
-    - `rxnorm`: `[{rxcui, name, tty, atc_code}]` (enriched via ATC for FDA modes)
-
-    Additional top-level keys for `interaction` mode:
-    - `drug_names`: input drug list
-    - `interaction`: `{pairs: [{drug_a, drug_b, description}], total_pairs}`
+    Output shape:
+    `{"mode", "keyword", "include_cancelled", "results": [...]}`
 
     Args:
-        mode: One of `drug_name` | `atc_code` | `ingredient` | `license_id` |
-              `rxnorm_resolve` | `rxnorm_ingredients` | `interaction`.
-              Defaults to `drug_name`.
-        keyword: Search term — meaning depends on mode (see above). Ignored for
-                 `interaction` mode.
-        drug_names: Required for `interaction` mode. List of ≥2 drug names,
-                    e.g. `["warfarin", "aspirin", "clopidogrel"]`.
-        limit: Maximum results to return (default 3, cap 10). Applies to
-               `drug_name`, `atc_code`, `ingredient`, and `rxnorm_resolve` modes.
-               Ignored for `license_id` (returns 1), `rxnorm_ingredients`, and
-               `interaction` (all pairs always returned).
+        mode: `"drug_name"` | `"ingredient"` | `"license_id"` | `"atc_code"`.
+        keyword: Search term interpreted according to `mode`.
+        limit: Maximum number of results to return (default 3, max 10).
+        include_cancelled: Include cancelled licenses when true.
     """
     if drug_service is None:
         return _svc_unavailable("Drug Service")
-    limit = min(max(1, limit), 10)
+    if await _drug_maintenance_active():
+        return _svc_maintenance("Drug")
+    if not keyword.strip():
+        return _json_error("keyword is required", mode=mode, results=[])
+
     if mode == "drug_name":
-        if not keyword:
-            return _json_error("Provide keyword")
-        raw = await drug_service.search_drug(keyword, limit=limit)
-        return await _normalize_drug_mode_payload(raw, "drug_name", keyword)
-    if mode == "atc_code":
-        import re
-
-        if not keyword:
-            return _json_error("Provide keyword")
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,6}", keyword):
-            return _json_error(
-                "ATC code mode accepts ATC code prefixes only (e.g. A10, A10BA02)."
-            )
-        raw = await drug_service.search_by_atc(keyword, limit=limit)
-        return await _normalize_drug_mode_payload(raw, "atc_code", keyword)
-    if mode == "ingredient":
-        if not keyword:
-            return _json_error("Provide keyword")
-        raw = await drug_service.search_by_ingredient(keyword, limit=limit)
-        return await _normalize_drug_mode_payload(raw, "ingredient", keyword)
-    if mode == "license_id":
-        if not keyword:
-            return _json_error("Provide keyword")
-        raw = await drug_service.search_by_license_id(keyword)
-        return await _normalize_drug_mode_payload(raw, "license_id", keyword)
-    if drug_interaction_service is None:
-        return _svc_unavailable("Drug Service")
-    if mode == "rxnorm_resolve":
-        if not keyword:
-            return _json_error("Provide keyword")
-        resolved = await drug_interaction_service.resolve_drug(keyword)
-        if isinstance(resolved, str):
-            try:
-                resolved = json.loads(resolved)
-            except json.JSONDecodeError:
-                resolved = []
-        if not isinstance(resolved, list):
-            resolved = []
-
-        all_rxcuis = [str(r.get("rxcui")) for r in resolved if isinstance(r, dict) and r.get("rxcui")]
-        atc_by_rxcui = await _load_atc_by_rxcuis(all_rxcuis)
-
-        # Bridge to TFDA: find Taiwan FDA drugs via ATC codes from IN/PIN concepts.
-        # Prefer ingredient-level concepts for ATC lookup (most specific mapping).
-        in_rxcuis = [
-            str(r.get("rxcui")) for r in resolved
-            if isinstance(r, dict) and r.get("rxcui") and r.get("tty") in ("IN", "PIN", "MIN")
-        ] or all_rxcuis[:3]
-        atc_codes = sorted({
-            row["atc_code"]
-            for rxcui in in_rxcuis
-            for row in atc_by_rxcui.get(rxcui, [])
-            if isinstance(row, dict) and row.get("atc_code")
-        })
-        if atc_codes and drug_service is not None:
-            raw = await drug_service.search_by_atc_codes(atc_codes, limit=limit)
-            return await _normalize_drug_mode_payload(raw, "rxnorm_resolve", keyword)
-
-        # Fallback: no TFDA match — return RxNorm-only items (capped at limit)
-        items: list[dict] = []
-        for concept in resolved[:limit]:
-            if not isinstance(concept, dict):
-                continue
-            rxcui = str(concept.get("rxcui") or "").strip()
-            row = _empty_drug_result_item()
-            row["name_en"] = concept.get("name")
-            row["atc"] = atc_by_rxcui.get(rxcui, [])
-            row["rxnorm"] = _normalize_rxnorm_entries(
-                [{"rxcui": rxcui, "name": concept.get("name"), "tty": concept.get("tty")}]
-            )
-            items.append(row)
-        return json.dumps(
-            {"mode": "rxnorm_resolve", "keyword": keyword, "results": items},
-            ensure_ascii=False,
+        payload = await _call_service_json(
+            drug_service,
+            "search_by_name",
+            keyword,
+            limit=limit,
+            include_cancelled=include_cancelled,
         )
-    if mode == "rxnorm_ingredients":
-        if not keyword:
-            return _json_error("Provide keyword")
-        payload = await drug_interaction_service.get_drug_ingredients(keyword)
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                payload = None
-        if not isinstance(payload, dict):
-            return json.dumps(
-                {"mode": "rxnorm_ingredients", "keyword": keyword, "results": []},
-                ensure_ascii=False,
-            )
-        rxcui = str(payload.get("rxcui") or "").strip()
-        ingredients = payload.get("ingredients")
-
-        # Collect RXCUIs for ATC lookup: concept itself + its ingredient children.
-        # ATC is typically assigned at IN level, so ingredient RXCUIs are preferred.
-        all_rxcuis = [rxcui] if rxcui else []
-        if isinstance(ingredients, list):
-            all_rxcuis += [
-                str(ing.get("rxcui"))
-                for ing in ingredients
-                if isinstance(ing, dict) and ing.get("rxcui")
-            ]
-        atc_by_rxcui = await _load_atc_by_rxcuis(all_rxcuis)
-        atc_codes = sorted({
-            row["atc_code"]
-            for rows in atc_by_rxcui.values()
-            for row in rows
-            if isinstance(row, dict) and row.get("atc_code")
-        })
-
-        # Bridge to TFDA: return Taiwan FDA drug records when ATC codes are available.
-        if atc_codes and drug_service is not None:
-            raw = await drug_service.search_by_atc_codes(atc_codes, limit=limit)
-            return await _normalize_drug_mode_payload(raw, "rxnorm_ingredients", keyword)
-
-        # Fallback: no TFDA match — return RxNorm-only result
-        row = _empty_drug_result_item()
-        row["name_en"] = payload.get("name")
-        row["atc"] = atc_by_rxcui.get(rxcui, [])
-        row["rxnorm"] = _normalize_rxnorm_entries(
-            [{"rxcui": rxcui, "name": payload.get("name"), "tty": payload.get("tty")}]
+    elif mode == "ingredient":
+        payload = await _call_service_json(
+            drug_service,
+            "search_by_ingredient",
+            keyword,
+            limit=limit,
+            include_cancelled=include_cancelled,
         )
-        if isinstance(ingredients, list):
-            row["ingredients"] = _normalize_ingredient_entries(
-                [
-                    {
-                        "ingredient_name": ing.get("name") if isinstance(ing, dict) else None,
-                        "ingredient_qty": None,
-                        "ingredient_unit": None,
-                        "rxcui": ing.get("rxcui") if isinstance(ing, dict) else None,
-                        "tty": ing.get("tty") if isinstance(ing, dict) else None,
-                    }
-                    for ing in ingredients
-                ]
-            )
-        return json.dumps(
-            {"mode": "rxnorm_ingredients", "keyword": keyword, "results": [row]},
-            ensure_ascii=False,
+    elif mode == "license_id":
+        payload = await _call_service_json(
+            drug_service,
+            "search_by_license_id",
+            keyword,
+            limit=limit,
+            include_cancelled=include_cancelled,
         )
-    if mode == "interaction":
-        if not drug_names or len(drug_names) < 2:
-            return _json_error(
-                "Provide drug_names with at least 2 drug names when mode is interaction"
-            )
-        result = await drug_interaction_service.check_interactions(drug_names)
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except json.JSONDecodeError:
-                result = {"error": "Invalid cached interaction payload"}
-        if not isinstance(result, dict):
-            result = {"error": "Invalid interaction payload"}
-        resolved = result.get("resolved_drugs")
-        if not isinstance(resolved, list):
-            resolved = []
-        rxcuis = [
-            str(item.get("rxcui"))
-            for item in resolved
-            if isinstance(item, dict) and item.get("rxcui")
-        ]
-        atc_by_rxcui = await _load_atc_by_rxcuis(rxcuis)
-        items: list[dict] = []
-        for item in resolved:
-            if not isinstance(item, dict):
-                continue
-            rxcui = str(item.get("rxcui") or "").strip()
-            row = _empty_drug_result_item()
-            row["name_en"] = item.get("name")
-            row["atc"] = atc_by_rxcui.get(rxcui, [])
-            row["rxnorm"] = _normalize_rxnorm_entries(
-                [
-                    {
-                        "rxcui": rxcui,
-                        "name": item.get("name"),
-                        "tty": item.get("tty"),
-                    }
-                ]
-            )
-            items.append(row)
-        return json.dumps(
-            {
-                "mode": "interaction",
-                "keyword": "",
-                "results": items,
-                "interaction": {
-                    "interaction_count": result.get("interaction_count", 0),
-                    "interactions": result.get("interactions", []),
-                    "resolved_drugs": resolved,
-                    "unresolved_drugs": result.get("unresolved_drugs", []),
-                },
-            },
-            ensure_ascii=False,
+    elif mode == "atc_code":
+        payload = await _call_service_json(
+            drug_service,
+            "search_by_atc_code",
+            keyword,
+            limit=limit,
+            include_cancelled=include_cancelled,
         )
-    return _json_error(
-        "Provide mode as drug_name, atc_code, ingredient, license_id, "
-        "rxnorm_resolve, rxnorm_ingredients, or interaction"
-    )
+    else:
+        return _json_error(
+            f"Unsupported mode: {mode}",
+            allowed_modes=["drug_name", "ingredient", "license_id", "atc_code"],
+        )
+
+    result = json.loads(payload)
+    result["mode"] = mode
+    result["keyword"] = keyword
+    result["include_cancelled"] = include_cancelled
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ============================================================
+# Group 2b: Drug detail and asset tools
+# ============================================================
+
+
 @audited("identify_unknown_pill")
 async def identify_unknown_pill(features: str) -> str:
     """
-    Identify a Taiwan FDA drug by pill appearance (color, shape, imprint markings).
+    Identify a Taiwan FDA drug by pill appearance keywords.
 
-    Searches the `appearance` field in the Taiwan FDA drug database using AND
-    logic — every provided keyword must match (more keywords → narrower results).
-
-    Matching behavior:
-    - English color/shape words (`white`, `round`, `oval`, `oblong`, `pink`, etc.)
-      are automatically expanded to Chinese synonyms used in FDA data.
-    - Imprint tokens that contain digits (e.g. `M500`, `PFIZER500`) are treated
-      as markings; if they cause zero results, the service auto-retries once
-      with digit-containing tokens removed to widen the search.
-    - Returns up to 5 matching drugs.
-
-    Output shape:
-    `{"results": [{license_id, name_zh, name_en, appearance}, ...], "total"}`
-
-    ⚠️ For reference only — always confirm pill identity with a licensed pharmacist
-    or cross-check with the official Taiwan FDA drug database.
+    Phase 2 uses enriched TFDA appearance records only. Every keyword is matched
+    conjunctively against appearance description, color, shape, symbol, scoring,
+    size, and imprint fields. English color/shape words are expanded with a
+    small built-in synonym map.
 
     Args:
-        features: Space-separated appearance keywords in Chinese or English.
-                  Each keyword is independently matched against shape, color,
-                  and marking fields.
-                  Examples:
-                  - `"白 圓形"` (white round)
-                  - `"橙色 橢圓"` (orange oval)
-                  - `"white round M500"` (white, round, imprint M500)
-                  - `"粉紅 菱形 PFIZER"` (pink diamond, PFIZER marking)
+        features: Space-separated appearance keywords, e.g. `"white round"` or
+            `"白 圓形"`.
     """
     if drug_service is None:
         return _svc_unavailable("Drug Service")
-    return await drug_service.identify_pill(features)
+    if await _drug_maintenance_active():
+        return _svc_maintenance("Drug")
+    if not features.strip():
+        return _json_error("features is required", results=[])
+    return await _call_service_json(drug_service, "identify_unknown_pill", features)
+
+
+@audited("get_drug_details")
+async def get_drug_details(
+    license_id: str,
+    include_cancelled: bool = False,
+) -> str:
+    """
+    Return the canonical normalized drug record for one Taiwan FDA license.
+
+    This is the detailed companion to `search_drug`. The response is built from
+    the canonical normalized JSON stored in PostgreSQL, augmented with current
+    stage availability and document counts.
+    """
+    if drug_service is None:
+        return _svc_unavailable("Drug Service")
+    if await _drug_maintenance_active():
+        return _svc_maintenance("Drug")
+    if not license_id.strip():
+        return _json_error("license_id is required")
+    return await _call_service_json(
+        drug_service,
+        "get_drug_details",
+        license_id,
+        include_cancelled=include_cancelled,
+    )
+
+
+@audited("get_drug_asset_links")
+async def get_drug_asset_links(
+    license_id: str | None = None,
+    asset_id: str | None = None,
+    asset_group: Literal["insert", "label", "shape", "analysis"] | None = None,
+    latest_insert_only: bool = False,
+) -> str:
+    """
+    Return persisted asset metadata plus runtime-generated MinIO download links.
+
+    The database stores stable MinIO locators; this tool adds temporary presigned
+    URLs when the MinIO service is configured and reachable.
+    """
+    if drug_service is None:
+        return _svc_unavailable("Drug Service")
+    if await _drug_maintenance_active():
+        return _svc_maintenance("Drug")
+    return await _call_service_json(
+        drug_service,
+        "get_drug_asset_links",
+        license_id=license_id,
+        asset_id=asset_id,
+        asset_group=asset_group,
+        latest_insert_only=latest_insert_only,
+    )
 
 
 # ============================================================
-# Group 3: Health Supplement (Taiwan FDA)
+# Group 3: Health Supplements (Taiwan FDA)
 # ============================================================
 
 
-async def _build_health_supplement_result(
-    row: dict,
-    *,
-    mode: str,
-    keyword: str,
-    icd_code: str | None = None,
-    recommended_benefits: list[str] | None = None,
-) -> dict:
-    result = {
+def _health_supplement_result(row: dict) -> dict:
+    """Shape one ``health_supplements.items`` row for MCP output.
+
+    Only columns that actually exist in the table are returned
+    (``permit_no, name, applicant, benefit_claims, category, valid_from``).
+    Earlier versions advertised ``ingredients/specs/status/source_url`` — none
+    of those columns exist, so they were always empty and have been removed.
+    The real ``category`` (類別) and ``approval_date`` (核可日期, stored in
+    ``valid_from``) were previously dropped and are now exposed.
+    """
+    return {
         "permit_no": row.get("permit_no"),
         "product_name": row.get("name"),
         "company": row.get("applicant"),
+        "category": row.get("category"),
         "benefits": row.get("benefit_claims"),
-        "ingredients": row.get("ingredients", []),
-        "specs": row.get("specs", {}),
-        "status": row.get("status"),
-        "source_url": row.get("source_url"),
+        "approval_date": row.get("valid_from") or None,
     }
-    return result
 
 
-@audited("search_health_supplement")
-async def search_health_supplement(
+@audited("search_health_supplements")
+async def search_health_supplements(
     mode: Literal["keyword", "permit_no", "condition"] = "keyword",
     keyword: str = "",
     limit: int = 3,
@@ -3178,25 +6860,28 @@ async def search_health_supplement(
       Returns extra top-level fields `icd_code` and `recommended_benefits`.
       Example: keyword `"糖尿病"` or `"E11"` or `"高血壓"`.
 
-    Response shape (all modes):
+    Response shape (all modes) — every field maps to a real Taiwan FDA column;
+    no synthetic/always-empty fields are returned:
     ```json
     {
       "mode": "keyword" | "permit_no" | "condition",
       "keyword": "<input>",
       "results": [
         {
-          "permit_no", "product_name", "company",
-          "benefits",      // approved benefit claims (string)
-          "ingredients",   // list of ingredient entries
-          "specs",         // packaging/dosage specs
-          "status",        // approval status
-          "source_url"     // FDA product page URL
+          "permit_no",       // FDA permit number (健食字…)
+          "product_name",    // 中文品名
+          "company",         // 申請商
+          "category",        // 類別 (e.g. 個案審查 / 規格標準)
+          "benefits",        // 保健功效 — approved benefit claims (string)
+          "approval_date"    // 核可日期 (YYYY-MM-DD or FDA date string), or null
         }
       ]
     }
     ```
     `condition` mode additionally includes `"icd_code"` and
-    `"recommended_benefits"` at the top level.
+    `"recommended_benefits"` at the top level. Note: the FDA dataset does not
+    publish per-product ingredient lists, packaging specs, or a product-page
+    URL, so those are intentionally not returned.
 
     Args:
         mode: `"keyword"` | `"permit_no"` | `"condition"`. Default `"keyword"`.
@@ -3206,15 +6891,17 @@ async def search_health_supplement(
         limit: Max results (default 3, cap 10). Applies to `keyword` and
                `condition` modes; ignored for `permit_no` (always returns ≤1).
     """
-    if health_food_service is None:
-        return _svc_unavailable("Health Supplement Service")
+    if health_supplements_service is None:
+        return _svc_unavailable("Health Supplements Service")
     if not keyword:
         return _json_error("Provide keyword")
 
     limit = min(max(1, limit), 10)
-    async with health_food_service.pool.acquire() as conn:
+    async with health_supplements_service.pool.acquire() as conn:
         if mode == "keyword":
-            raw = await health_food_service.search_health_food(keyword, limit=limit)
+            raw = await health_supplements_service.search_health_supplements(
+                keyword, limit=limit
+            )
             payload = json.loads(raw)
             results = []
             for item in payload.get("results", []):
@@ -3222,22 +6909,21 @@ async def search_health_supplement(
                 if not permit_no:
                     continue
                 row = await conn.fetchrow(
-                    "SELECT * FROM health_food.items WHERE permit_no = $1", permit_no
+                    "SELECT * FROM health_supplements.items WHERE permit_no = $1",
+                    permit_no,
                 )
                 if row:
-                    results.append(
-                        await _build_health_supplement_result(
-                            dict(row), mode=mode, keyword=keyword
-                        )
-                    )
-            return json.dumps(
-                {"mode": mode, "keyword": keyword, "results": results},
-                ensure_ascii=False,
-            )
+                    results.append(_health_supplement_result(dict(row)))
+            out = {"mode": mode, "keyword": keyword, "results": results}
+            # Carry the service's keyword-only degradation marker, if any.
+            if "search_mode" in payload:
+                out["search_mode"] = payload["search_mode"]
+                out["search_note"] = payload.get("search_note")
+            return json.dumps(out, ensure_ascii=False)
 
         if mode == "permit_no":
             row = await conn.fetchrow(
-                "SELECT * FROM health_food.items WHERE permit_no = $1", keyword
+                "SELECT * FROM health_supplements.items WHERE permit_no = $1", keyword
             )
             if not row:
                 digits = re.search(r"\d+", keyword)
@@ -3245,12 +6931,12 @@ async def search_health_supplement(
                     digits_only = digits.group()
                     if keyword.isdigit():
                         row = await conn.fetchrow(
-                            "SELECT * FROM health_food.items WHERE permit_no ILIKE $1 ORDER BY permit_no LIMIT 1",
+                            "SELECT * FROM health_supplements.items WHERE permit_no ILIKE $1 ORDER BY permit_no LIMIT 1",
                             f"%{digits_only}%",
                         )
                     else:
                         rows = await conn.fetch(
-                            "SELECT * FROM health_food.items WHERE permit_no ILIKE $1 ORDER BY permit_no LIMIT 50",
+                            "SELECT * FROM health_supplements.items WHERE permit_no ILIKE $1 ORDER BY permit_no LIMIT 50",
                             f"%{digits_only}%",
                         )
                         row = rows[0] if rows else None
@@ -3263,41 +6949,30 @@ async def search_health_supplement(
                 {
                     "mode": mode,
                     "keyword": keyword,
-                    "results": [
-                        await _build_health_supplement_result(
-                            dict(row), mode=mode, keyword=keyword
-                        )
-                    ],
+                    "results": [_health_supplement_result(dict(row))],
                 },
                 ensure_ascii=False,
             )
 
         if mode == "condition":
-            raw = await health_food_service.analyze_health_support_for_condition(
+            raw = await health_supplements_service.analyze_health_support_for_condition(
                 keyword, icd_service=icd_service
             )
             payload = json.loads(raw)
             icd_code = payload.get("icd_code")
             recommended_benefits = payload.get("recommended_benefits", [])
-            foods = payload.get("health_foods", [])
+            foods = payload.get("health_supplements", [])
             results = []
             for food in foods[:limit]:
                 permit_no = food.get("permit_no")
                 if not permit_no:
                     continue
                 row = await conn.fetchrow(
-                    "SELECT * FROM health_food.items WHERE permit_no = $1", permit_no
+                    "SELECT * FROM health_supplements.items WHERE permit_no = $1",
+                    permit_no,
                 )
                 if row:
-                    results.append(
-                        await _build_health_supplement_result(
-                            dict(row),
-                            mode=mode,
-                            keyword=keyword,
-                            icd_code=icd_code,
-                            recommended_benefits=recommended_benefits,
-                        )
-                    )
+                    results.append(_health_supplement_result(dict(row)))
             return json.dumps(
                 {
                     "mode": mode,
@@ -3365,16 +7040,21 @@ async def query_food_nutrition(
         return _svc_unavailable("Food Nutrition Service")
     if detailed:
         return await food_nutrition_service.get_detailed_nutrition(food_name)
-    return await food_nutrition_service.search_nutrition(food_name, nutrient, limit=limit)
+    return await food_nutrition_service.search_nutrition(
+        food_name, nutrient, limit=limit
+    )
 
 
 @audited("query_food_ingredient")
 async def query_food_ingredient(
     keyword: str,
-    category: Literal[
-        "可供食品使用之原料",
-        "未確認安全性尚不得使用之原料",
-    ] | None = None,
+    category: (
+        Literal[
+            "可供食品使用之原料",
+            "未確認安全性尚不得使用之原料",
+        ]
+        | None
+    ) = None,
     limit: int = 3,
 ) -> str:
     """
@@ -3429,7 +7109,10 @@ async def search_foods_by_nutrient(nutrient: str, limit: int = 20) -> str:
     content of the requested nutrient is first.
 
     Output shape:
-    `{"nutrient", "unit", "foods": [{food_name, food_code, category, value}, ...]}`
+    `{"nutrient", "unit", "total", "note", "foods": [{name, common_name,
+      category, content_per_100g, unit}, ...]}`
+    `nutrient` echoes the resolved canonical column name (e.g. `"蛋白質"`
+    resolves to `"粗蛋白"`). Foods have no stable code, so none is returned.
 
     Args:
         nutrient: Nutrient name in Chinese or English — aliases and synonyms
@@ -3539,6 +7222,9 @@ async def query_fhir_condition(
         recorded_date: `YYYY-MM-DDTHH:MM:SS+08:00` timestamp. Only applied in Path A.
         additional_notes: Optional clinical note string. Only applied in Path A.
     """
+    # FHIR Condition is built from icd.diagnoses, so it follows ICD maintenance.
+    if await _icd_maintenance_active():
+        return _svc_maintenance("ICD")
     if fhir_condition_service is None:
         return _svc_unavailable("FHIR Condition Service")
     if diagnosis_keyword:
@@ -3607,7 +7293,7 @@ async def validate_fhir_condition(condition_json: str) -> str:
 
 
 # ============================================================
-# Group 7: FHIR Medication
+# Group 5B: FHIR Medication
 # ============================================================
 @audited("query_fhir_medication")
 async def query_fhir_medication(
@@ -3616,54 +7302,47 @@ async def query_fhir_medication(
     resource_type: Literal["Medication", "MedicationKnowledge"] = "Medication",
 ) -> str:
     """
-    Generate a FHIR R4 Medication or MedicationKnowledge resource for a Taiwan FDA drug.
+    Generate a FHIR R4 Medication or MedicationKnowledge resource for a TFDA drug.
 
     Two routing paths (provide exactly one of `license_id` or `keyword`):
 
     **Path A — direct license** (`license_id` provided):
-    Builds the resource directly from the exact Taiwan FDA license ID.
-    Supports both `Medication` and `MedicationKnowledge` resource types.
+    Builds the resource directly from the exact TFDA license ID or bare numeric
+    token. Supports both `Medication` and `MedicationKnowledge`.
 
     **Path B — keyword search** (`keyword` provided):
-    Searches the Taiwan FDA drug database for the best-matching drug, then builds
-    the resource from that match. Only `Medication` resource type is generated in
-    this path (the `resource_type` parameter is forwarded and respected).
+    Searches the normalized drug records for the best-matching TFDA drug first,
+    then builds the requested FHIR resource from that selected match.
 
-    Resource type differences:
-    - `Medication` (default): concise FHIR R4 Medication resource with code,
-      form, ingredient list, and manufacturer extension.
-    - `MedicationKnowledge`: richer resource that additionally includes
-      `monograph`, `drugCharacteristic` (appearance/color/shape), `packaging`,
-      `indication`, and regulatory extension fields.
-
-    Always returns exactly one FHIR resource JSON object; never writes to an
-    external FHIR server.
+    Output: a FHIR R4 Medication-family JSON object derived from normalized
+    TFDA data only. No RxNorm dependency is used anywhere in this flow.
 
     Args:
-        license_id: Exact Taiwan FDA license number, e.g. `"衛署藥製字第000029號"`
-                    or bare digits `"000029"`. Takes priority when both provided.
-        keyword: Drug name in Chinese or English for search-first flow,
-                 e.g. `"metformin"`, `"阿斯匹靈"`, `"Lipitor"`.
-        resource_type: `"Medication"` (default) | `"MedicationKnowledge"`.
+        license_id: Exact TFDA license number, e.g. `"衛署藥製字第000480號"`
+            or bare digits like `"000480"`. Takes priority over `keyword`.
+        keyword: Drug name or ingredient term for search-first flow,
+            e.g. `"普拿疼"` or `"acetaminophen"`.
+        resource_type: `"Medication"` (default) or `"MedicationKnowledge"`.
     """
     if fhir_medication_service is None:
         return _svc_unavailable("FHIR Medication Service")
+    if await _drug_maintenance_active():
+        return _svc_maintenance("Drug")
+    if license_id:
+        return await _call_service_json(
+            fhir_medication_service,
+            "create_medication",
+            license_id=license_id,
+            resource_type=resource_type,
+        )
     if keyword:
         return await _call_service_json(
             fhir_medication_service,
             "create_medication_from_search",
-            keyword,
-            resource_type,
+            keyword=keyword,
+            resource_type=resource_type,
         )
-    if not license_id:
-        return _json_error("Provide either license_id or keyword")
-    if resource_type == "MedicationKnowledge":
-        return await _call_service_json(
-            fhir_medication_service, "create_medication_knowledge", license_id
-        )
-    return await _call_service_json(
-        fhir_medication_service, "create_medication", license_id
-    )
+    return _json_error("Provide either license_id or keyword")
 
 
 @audited("validate_fhir_medication")
@@ -3674,33 +7353,23 @@ async def validate_fhir_medication(medication_json: str) -> str:
     Supported resource types: `Medication` and `MedicationKnowledge`.
     The validator detects the type from `resourceType` in the JSON.
 
-    Validation checks for `Medication`:
-    - `resourceType` = `"Medication"`
+    Validation checks:
+    - `resourceType` must be `Medication` or `MedicationKnowledge`
     - `code.coding` must be present with at least one entry
-    - `ingredient` array entries must each have `itemCodeableConcept` or
-      `itemReference`
-
-    Validation checks for `MedicationKnowledge`:
-    - `resourceType` = `"MedicationKnowledge"`
-    - `code.coding` must be present
-    - `ingredient` entries same as Medication
+    - each `ingredient` row must include `itemCodeableConcept` or `itemReference`
 
     Output shape:
-    `{"valid": true|false, "resource_type": "Medication"|"MedicationKnowledge",
-     "errors": ["..."]}`
-
-    ⚠️ Server-side structural validation only. For production-grade TWCore IG
-    profile conformance, use the HL7 FHIR Validator with the TWCore IG package.
+    `{"valid": true|false, "resource_type": "...", "errors": ["..."]}`
 
     Args:
         medication_json: JSON string of a FHIR Medication or MedicationKnowledge
-                         resource. Use `query_fhir_medication` to generate one.
+            resource. Use `query_fhir_medication` to generate one first.
     """
     if fhir_medication_service is None:
         return _svc_unavailable("FHIR Medication Service")
     try:
-        resource = json.loads(medication_json)
-        result = fhir_medication_service.validate_medication(resource)
+        medication = json.loads(medication_json)
+        result = fhir_medication_service.validate_medication(medication)
         return fhir_medication_service.to_json_string(result, indent=2)
     except json.JSONDecodeError as e:
         return _json_error(
@@ -3709,7 +7378,7 @@ async def validate_fhir_medication(medication_json: str) -> str:
 
 
 # ============================================================
-# Group 8: Lab / LOINC
+# Group 6: Lab / LOINC
 # ============================================================
 
 
@@ -3728,7 +7397,7 @@ async def search_loinc(
       Uses hybrid BM25 + semantic embedding re-ranking. Optional `category`
       parameter narrows to a LOINC class (e.g. `"CHEM"`, `"HEM/BC"`, `"UA"`).
       Examples: keyword `"HbA1c"`, `"Glucose Serum"`, `"ALT"`, `"血紅素"`.
-    - `category`: list or filter LOINC categories from the local dataset.
+    - `category`: list or filter LOINC categories from the local module.
       Without `keyword` → returns all categories with counts.
       With `keyword` → client-side filters the category list (case-insensitive
       substring match; no embedding). Useful for finding valid class codes to
@@ -3740,8 +7409,11 @@ async def search_loinc(
 
     Output shapes:
     - `category` mode: `{"mode", "keyword", "total_found", "categories": [...]}`
-    - other modes: ranked list of LOINC records `[{loinc_code, long_common_name,
-      component, system, method_type, scale_type, class, ...}]`
+    - other modes: `{"keyword", "total_found", "results": [...]}` where each
+      record carries the full LOINC axes: `loinc_num, long_common_name,
+      shortname, name_zh, common_name_zh, component, property, time_aspect,
+      system, scale_type, method_type, class, classtype, specimen_type, unit,
+      status`. (`specimen`/`component` modes group/return a focused subset.)
 
     Keyword is required for `code`, `specimen`, and `component` modes.
     For `category` mode, omitting `keyword` returns all categories.
@@ -3755,6 +7427,8 @@ async def search_loinc(
         limit: Max results (default 3, max 10). Ignored for `category` when
                `keyword` is empty (returns all categories).
     """
+    if await _loinc_maintenance_active():
+        return _svc_maintenance("LOINC")
     if lab_service is None:
         return _svc_unavailable("Lab Service")
 
@@ -3769,9 +7443,7 @@ async def search_loinc(
         except Exception:
             return raw
         categories = parsed.get("categories") or []
-        filtered = [
-            c for c in categories if keyword.lower() in str(c).lower()
-        ][:limit]
+        filtered = [c for c in categories if keyword.lower() in str(c).lower()][:limit]
         return json.dumps(
             {
                 "mode": "category",
@@ -3834,6 +7506,8 @@ async def query_loinc(
         gender: `"M"` | `"F"` | `"all"` (default). Used in `reference_range` to
                 select sex-specific intervals; ignored in `detail` mode.
     """
+    if await _loinc_maintenance_active():
+        return _svc_maintenance("LOINC")
     if lab_service is None:
         return _svc_unavailable("Lab Service")
     if not loinc_code:
@@ -3887,6 +7561,8 @@ async def interpret_lab_result(
         age: Patient age in years (integer).
         gender: `"M"` | `"F"` | `"all"` (default, gender-neutral range).
     """
+    if await _loinc_maintenance_active():
+        return _svc_maintenance("LOINC")
     if lab_service is None:
         return _svc_unavailable("Lab Service")
     return await lab_service.interpret_lab_result(loinc_code, value, age, gender)
@@ -3927,6 +7603,8 @@ async def batch_interpret_lab_results(
         age: Patient age in years (integer).
         gender: `"M"` | `"F"` | `"all"` (gender-neutral, default).
     """
+    if await _loinc_maintenance_active():
+        return _svc_maintenance("LOINC")
     if lab_service is None:
         return _svc_unavailable("Lab Service")
     try:
@@ -3934,7 +7612,9 @@ async def batch_interpret_lab_results(
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"Invalid JSON: {e}"}, ensure_ascii=False)
     if not isinstance(results, list):
-        return _json_error("results_json must be a JSON array of {loinc_code, value} objects")
+        return _json_error(
+            "results_json must be a JSON array of {loinc_code, value} objects"
+        )
     return await lab_service.batch_interpret_results(results, age, gender)
 
 
@@ -3970,11 +7650,16 @@ async def search_clinical_guideline(keyword: str, limit: int = 3) -> str:
     if guideline_service is None:
         return _svc_unavailable("Clinical Guideline Service")
     return await guideline_service.search_guideline(keyword, limit=limit)
+
+
 @audited("query_guideline")
 async def query_guideline(
     icd_code: str,
-    section: Literal["complete", "medication", "test", "goals", "pathway"] = "complete",
+    section: Literal[
+        "complete", "medication", "test", "goals", "pathway", "contraindications"
+    ] = "complete",
     patient_context_json: str | None = None,
+    medication_class: str | None = None,
 ) -> str:
     """
     Retrieve a specific section from a Taiwan clinical practice guideline.
@@ -3998,6 +7683,12 @@ async def query_guideline(
       optional `patient_context_json` to personalize the recommendations.
       Example personalized pathway for a 65-year-old with CKD:
       `patient_context_json='{"age": 65, "comorbidities": ["CKD", "heart failure"]}'`
+    - `contraindications`: guideline recommendations and contraindications for a
+      specific drug class against this diagnosis. REQUIRES `medication_class`.
+      Returns `matched_recommendations` (rows whose class/examples match),
+      `all_contraindications_for_diagnosis`, and a clinician-review warning.
+      Example: `query_guideline(icd_code="E11", section="contraindications",
+      medication_class="Metformin")`.
 
     Output: JSON object whose shape varies by section; always contains
     `icd_code` and `section` at the top level.
@@ -4006,13 +7697,17 @@ async def query_guideline(
         icd_code: Guideline ICD-10 key, e.g. `"E11"` (type 2 DM), `"I10"`
                   (hypertension), `"N18"` (CKD), `"E78"` (dyslipidaemia).
                   Use `search_clinical_guideline` to discover valid keys.
-        section: `"complete"` | `"medication"` | `"test"` | `"goals"` | `"pathway"`.
+        section: `"complete"` | `"medication"` | `"test"` | `"goals"` |
+                 `"pathway"` | `"contraindications"`.
         patient_context_json: Optional JSON object string providing patient context
                               for `section="pathway"` only. Ignored for other sections.
                               Supported keys: `age` (int), `gender` ("M"|"F"),
                               `comorbidities` (list of strings), `current_medications`
                               (list), `lab_values` (object). Any subset is valid.
                               Example: `'{"age": 70, "comorbidities": ["CKD stage 3"]}'`
+        medication_class: Drug class or example name. REQUIRED for
+                          `section="contraindications"` (e.g. `"Metformin"`,
+                          `"ACE inhibitor"`); ignored for other sections.
     """
     if guideline_service is None:
         return _svc_unavailable("Clinical Guideline Service")
@@ -4022,12 +7717,21 @@ async def query_guideline(
         "test": "get_test_recommendations",
         "goals": "get_treatment_goals",
         "pathway": "suggest_clinical_pathway",
+        "contraindications": "check_medication_contraindications",
     }
     method_name = section_map.get(section)
     if method_name is None:
         return _json_error(
             f"Unknown guideline section: {section}",
             allowed_sections=list(section_map),
+        )
+    if method_name == "check_medication_contraindications":
+        if not medication_class:
+            return _json_error(
+                "medication_class is required for section=contraindications"
+            )
+        return await _call_service_json(
+            guideline_service, method_name, icd_code, medication_class
         )
     if method_name == "suggest_clinical_pathway":
         context = None
@@ -4036,73 +7740,642 @@ async def query_guideline(
                 context = json.loads(patient_context_json)
             except json.JSONDecodeError:
                 return _json_error("patient_context_json is not valid JSON")
-        return await _call_service_json(guideline_service, method_name, icd_code, context)
+        return await _call_service_json(
+            guideline_service, method_name, icd_code, context
+        )
     return await _call_service_json(guideline_service, method_name, icd_code)
+
+
 # ============================================================
-# Group 10: TWCore IG
+# Group 10: FHIR IG (multi-IG discovery + StructureDefinition reading)
 # ============================================================
-@audited("query_twcore_code")
-async def query_twcore_code(
-    category: (
-        Literal["all", "medication", "diagnosis", "organization", "administrative"]
-        | None
-    ) = None,
-    keyword: str | None = None,
-    code: str | None = None,
-    codesystem_ids: list[str] | None = None,
-    codesystem_id: str | None = None,
-) -> str:
+# Generic, IG-scoped toolset over the multi-IG `fhir.*` store. Every tool takes
+# optional `package_id` + `version`; omit both to target the default IG. Every
+# response uses the common envelope {ok, data, warnings, provenance, error?}.
+
+
+def _fhir_ig_unavailable() -> str:
+    return _svc_unavailable("FHIR IG Service")
+
+
+@audited("fhir_list_igs")
+async def fhir_list_igs() -> str:
+    """List the FHIR Implementation Guide (IG) packages installed on this server.
+
+    Returns each IG's `packageId`, `version`, `title`, `canonical`, `fhirVersion`,
+    `status`, `isDefault` flag, and declared `dependencies`. Use this first when
+    several IGs are installed and you must pick one (match by jurisdiction/intent);
+    the `isDefault` IG is used when a tool is called without `package_id`.
     """
-    Browse, search, or look up Taiwan TWCore IG CodeSystem entries.
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.list_igs()
 
-    Three routing modes — the tool dispatches based on which parameters are provided:
 
-    **List mode** (`category` only, no `keyword` or `code`):
-    Returns all CodeSystems grouped under the given category.
-    `category` values: `"all"`, `"medication"`, `"diagnosis"`,
-    `"organization"`, `"administrative"`.
-    Example: `query_twcore_code(category="medication")` → lists medication
-    frequency, route, and dosage form codesystems.
-
-    **Lookup mode** (`code` + `codesystem_id`):
-    Returns the exact entry for one code within a specific CodeSystem.
-    Requires both `code` and `codesystem_id` to be provided.
-    Example: `query_twcore_code(code="QD", codesystem_id="medication-frequency-nhi-tw")`
-    → returns `{code: "QD", display: "每日一次", system: "..."}`.
-
-    **Search mode** (`keyword`, optionally + `codesystem_ids`):
-    Full-text search for a code or display name across one or more CodeSystems.
-    `codesystem_ids` narrows to specific systems; omit (or pass `null`) to
-    search all CodeSystems.
-    Example: `query_twcore_code(keyword="BID")` → searches across all systems.
-    Example: `query_twcore_code(keyword="每日", codesystem_ids=["medication-frequency-nhi-tw"])`
-
-    Routing priority (when multiple parameters are given):
-    1. If `category` is set and `keyword`/`code` are both absent → list mode
-    2. If `code` + `codesystem_id` are both set → lookup mode
-    3. If `keyword` is set → search mode
-    4. Otherwise → error
+@audited("fhir_get_ig")
+async def fhir_get_ig(package_id: str | None = None, version: str | None = None) -> str:
+    """Details of one IG package: identity, dependencies, and per-resource-type
+    artifact counts.
 
     Args:
-        category: Category for list mode: `"all"` | `"medication"` | `"diagnosis"` |
-                  `"organization"` | `"administrative"`.
-        keyword: Search text for search mode (code abbreviation or display name).
-        code: Exact code value for lookup mode (e.g. `"QD"`, `"PO"`, `"BID"`).
-        codesystem_ids: List of CodeSystem IDs to restrict search mode.
-                        Omit to search all systems.
-        codesystem_id: Single CodeSystem ID for lookup mode
-                       (e.g. `"medication-frequency-nhi-tw"`).
+        package_id: IG package id (e.g. `"tw.gov.mohw.twcore"`). Omit → default IG.
+        version: Specific version. Omit → that package's default/highest.
     """
-    if twcore_service is None:
-        return _svc_unavailable("TWCore Service")
-    if category is not None and keyword is None and code is None:
-        return await twcore_service.list_codesystems(category)
-    if code and codesystem_id:
-        return await twcore_service.lookup_code(code, codesystem_id)
-    if keyword:
-        return await twcore_service.search_code(keyword, codesystem_ids)
-    return _json_error(
-        "Provide category, or either (code + codesystem_id) or (keyword + optional codesystem_ids)"
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.get_ig(package_id=package_id, version=version)
+
+
+@audited("fhir_list_artifacts")
+async def fhir_list_artifacts(
+    resource_type: str | None = None,
+    grouping_id: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List an IG's conformance artifacts (StructureDefinitions, ValueSets,
+    CodeSystems, examples, …) as summary rows.
+
+    Args:
+        resource_type: FHIR type filter, e.g. `"StructureDefinition"`, `"ValueSet"`.
+        grouping_id: IG grouping filter, e.g. `"profiles"`, `"terminology"`,
+            `"extensions-datatypes"`, `"examples"`.
+        package_id / version: target IG (omit → default IG).
+        limit: max rows (default 50, cap 200).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.list_artifacts(
+        package_id=package_id,
+        version=version,
+        resource_type=resource_type,
+        grouping_id=grouping_id,
+        limit=limit,
+    )
+
+
+@audited("fhir_search_artifacts")
+async def fhir_search_artifacts(
+    keyword: str,
+    resource_type: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Full-text search an IG's artifacts by id / canonical URL / name / title /
+    description.
+
+    Args:
+        keyword: search term.
+        resource_type: optional FHIR type filter.
+        package_id / version: target IG (omit → default IG).
+        limit: max rows (default 20, cap 100).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.search_artifacts(
+        keyword=keyword,
+        package_id=package_id,
+        version=version,
+        resource_type=resource_type,
+        limit=limit,
+    )
+
+
+@audited("fhir_list_resource_profiles")
+async def fhir_list_resource_profiles(
+    base_type: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """List the IG's selectable resource Profiles (constraint StructureDefinitions),
+    grouped by the base FHIR resource type they constrain
+    (e.g. `Patient` → `Patient-twcore`).
+
+    Args:
+        base_type: optional base resource filter, e.g. `"Condition"`.
+        package_id / version: target IG (omit → default IG).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.list_resource_profiles(
+        package_id=package_id, version=version, base_type=base_type
+    )
+
+
+@audited("fhir_rank_resource_profiles")
+async def fhir_rank_resource_profiles(
+    keys: list[str],
+    base_type: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+    limit: int = 5,
+) -> str:
+    """Rank candidate Profiles by how many of your source-data field keys match
+    each profile's element paths. This **only suggests** — the response carries
+    `selectionRequired:true`; you must make the final pick yourself, it never
+    auto-maps.
+
+    Args:
+        keys: source field names you intend to populate, e.g.
+            `["code", "subject", "onset", "clinicalStatus"]`.
+        base_type: optional base resource filter, e.g. `"Condition"`.
+        package_id / version: target IG (omit → default IG).
+        limit: max candidates (default 5, cap 20).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.rank_resource_profiles(
+        keys=keys,
+        package_id=package_id,
+        version=version,
+        base_type=base_type,
+        limit=limit,
+    )
+
+
+@audited("fhir_get_profile")
+async def fhir_get_profile(
+    identifier: str,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """Summary of one Profile / StructureDefinition: identity, base definition,
+    derivation, and element count. Resolve by artifact id, canonical URL, or
+    artifact_key; canonicals defined in a dependency IG resolve transitively.
+
+    Args:
+        identifier: profile id (e.g. `"Condition-twcore"`), canonical URL, or key.
+        package_id / version: target IG (omit → default IG).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.get_profile(
+        identifier=identifier, package_id=package_id, version=version
+    )
+
+
+@audited("fhir_get_profile_elements")
+async def fhir_get_profile_elements(
+    profile: str,
+    view: Literal[
+        "elements", "element", "slices", "choices", "binding", "examples"
+    ] = "elements",
+    path: str | None = None,
+    slice_name: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+    limit: int = 200,
+) -> str:
+    """Read a Profile's StructureDefinition snapshot — the structural truth
+    (cardinality, types, bindings, slicing, choice[x], constraints).
+
+    One tool, several `view`s of the same snapshot:
+    - `elements` (default): every element projected (min/max/types/mustSupport/
+      binding/fixed/pattern/short/constraints).
+    - `element`: a single element by `path` (optionally a named slice via
+      `slice_name`).
+    - `slices`: `slicing` rules + discriminator + the defined slices at `path`.
+    - `choices`: a `[x]` element's allowed types + the JSON property name for each
+      (e.g. `Condition.onset[x]` → `onsetDateTime` / `onsetPeriod` / …).
+    - `binding`: the terminology binding (strength + ValueSet) on `path`.
+    - `examples`: official example instances whose `meta.profile` cites this profile.
+
+    `path` is required for `element` / `slices` / `choices` / `binding`.
+
+    Args:
+        profile: profile id (e.g. `"Condition-twcore"`), canonical URL, or key.
+        view: which projection to return (see above).
+        path: element path, e.g. `"Condition.code"` (required for some views).
+        slice_name: optional slice name for `view=element`.
+        package_id / version: target IG (omit → default IG).
+        limit: max elements for `view=elements` (default 200, cap 1000).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.get_profile_elements(
+        profile=profile,
+        package_id=package_id,
+        version=version,
+        view=view,
+        path=path,
+        slice_name=slice_name,
+        limit=limit,
+    )
+
+
+# ---- Terminology (Phase 2) -------------------------------------------------- #
+
+
+@audited("fhir_get_valueset")
+async def fhir_get_valueset(
+    identifier: str,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """Return a ValueSet's definition (`compose` block + metadata) without
+    expanding it. Use `fhir_expand_valueset` to enumerate the member codes.
+
+    Args:
+        identifier: ValueSet id (e.g. `"condition-code-sct-tw"`), canonical URL,
+            or artifact_key.
+        package_id / version: target IG (omit → default IG).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.get_valueset(
+        identifier=identifier, package_id=package_id, version=version
+    )
+
+
+@audited("fhir_expand_valueset")
+async def fhir_expand_valueset(
+    identifier: str,
+    package_id: str | None = None,
+    version: str | None = None,
+    limit: int = 500,
+) -> str:
+    """Expand a ValueSet to its member codings, resolved locally where possible:
+    inline concepts, SNOMED `is-a` descendants, whole IG CodeSystems, and imported
+    ValueSets. Whole large external systems are NOT enumerated (a `TOO_BROAD`
+    warning + `unresolved` entry is returned instead); when the result is capped,
+    `truncated:true` is set — the tool never silently drops codes.
+
+    Args:
+        identifier: ValueSet id, canonical URL, or artifact_key.
+        package_id / version: target IG (omit → default IG).
+        limit: max codings to return (default 500, cap 2000).
+
+    Returns `{codings[], total, truncated, unresolved[]}` in `data`.
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.expand_valueset(
+        identifier=identifier, package_id=package_id, version=version, limit=limit
+    )
+
+
+@audited("fhir_lookup_code")
+async def fhir_lookup_code(
+    system: str,
+    code: str,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """Look up the display/definition of a `(system, code)` pair from locally held
+    terminology (IG CodeSystems, SNOMED CT, LOINC, ICD). This is the replacement
+    for the former `query_twcore_code` lookup. If the code's system is external
+    and not held, `found:false` is returned with a warning — never a fabricated
+    display.
+
+    Args:
+        system: code system URL (e.g. `"http://snomed.info/sct"`) or an IG
+            CodeSystem canonical.
+        code: the code value (e.g. `"6142004"`).
+        package_id / version: target IG for IG-internal systems (omit → default).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.lookup_code(
+        system=system, code=code, package_id=package_id, version=version
+    )
+
+
+@audited("fhir_validate_code")
+async def fhir_validate_code(
+    system: str,
+    code: str,
+    value_set: str,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """Check whether a `(system, code)` is a member of a ValueSet (expand-then-
+    contains). Returns `result` = `"valid"` | `"invalid"` | `"unverifiable"`.
+    When the bound system cannot be fully expanded locally, the result is
+    `"unverifiable"` (never a false `invalid`/`valid`).
+
+    Args:
+        system: the code's system URL.
+        code: the code value.
+        value_set: ValueSet id / canonical / artifact_key to validate against.
+        package_id / version: target IG (omit → default IG).
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.validate_code(
+        system=system,
+        code=code,
+        value_set=value_set,
+        package_id=package_id,
+        version=version,
+    )
+
+
+@audited("fhir_normalize_code")
+async def fhir_normalize_code(
+    text: str,
+    value_set: str | None = None,
+    system: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+    limit: int = 10,
+) -> str:
+    """Turn free text (e.g. a clinical phrase like `"流行性感冒"`) into ranked
+    candidate codes for a target system or ValueSet. Hybrid matching: IG
+    ConceptMaps, lexical display/alias match, and semantic embedding search
+    (semantic degrades gracefully when the embedding service is offline).
+
+    The candidates are *suggestions* — always confirm the chosen one with
+    `fhir_validate_code` before writing it into a resource.
+
+    Args:
+        text: the free-text term to normalize.
+        value_set: a ValueSet to scope candidates to (its bound systems are the
+            targets; a SNOMED `is-a` filter scopes to that subtree).
+        system: an explicit target system (alternative to `value_set`).
+        package_id / version: target IG (omit → default IG).
+        limit: max candidates (default 10, cap 50).
+
+    Provide at least one of `value_set` or `system`.
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.normalize_code(
+        text=text,
+        value_set=value_set,
+        system=system,
+        package_id=package_id,
+        version=version,
+        limit=limit,
+    )
+
+
+# ---- Reference / Bundle (Phase 3 — IG-agnostic pure logic) ------------------ #
+
+
+def _fhir_env_ok(data, warnings=None) -> str:
+    return json.dumps(
+        {"ok": True, "data": data, "warnings": warnings or [], "provenance": None},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _fhir_env_err(code: str, message: str) -> str:
+    return json.dumps(
+        {
+            "ok": False,
+            "data": None,
+            "warnings": [],
+            "error": {"code": code, "message": message},
+        },
+        ensure_ascii=False,
+    )
+
+
+@audited("fhir_resolve_reference")
+async def fhir_resolve_reference(
+    key: str,
+    resource_type: str | None = None,
+    context_id: str | None = None,
+    display: str | None = None,
+) -> str:
+    """Mint (or return) a stable `urn:uuid` reference for a logical `key` within a
+    build context, so resources can reference each other before they are finalized.
+
+    Use the returned `reference` as BOTH the target resource's `fullUrl` and the
+    referrer's `reference` value. The same `(contextId, key)` always returns the
+    same urn. The first call (no `context_id`) creates a context and returns its
+    `contextId`; pass that id back on subsequent calls in the same build session.
+
+    Args:
+        key: a stable logical id for the resource (e.g. `"patient-1"`).
+        resource_type: optional FHIR type, echoed back for convenience.
+        context_id: the build context to use; omit to start a new one.
+        display: optional display text, echoed back.
+
+    Returns `{contextId, reference, resourceType, display}`.
+    """
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    if not key or not str(key).strip():
+        return _fhir_env_err("INVALID_ARGUMENT", "key is required")
+    cid, urn = fhir_reference.mint(context_id, str(key))
+    return _fhir_env_ok(
+        {
+            "contextId": cid,
+            "reference": urn,
+            "resourceType": resource_type,
+            "display": display,
+        }
+    )
+
+
+@audited("fhir_build_bundle")
+async def fhir_build_bundle(
+    entries: list[dict],
+    bundle_type: str = "transaction",
+    context_id: str | None = None,
+) -> str:
+    """Assemble inline FHIR resources into a Bundle, wiring `urn:uuid` references.
+
+    Each entry is `{resource, key?, fullUrl?, request?}`. Each entry's `fullUrl` is
+    taken from an explicit `fullUrl`, else minted from its `key` via the context,
+    else a fresh urn. References inside resources that name a known `key` (or
+    `Type/key`) are rewritten to the matching urn; `urn:uuid:` references that do
+    not match any entry are reported in `unresolved` (never guessed). For
+    `transaction` bundles, a default `request` of `POST <resourceType>` is added
+    when an entry omits one.
+
+    This does NOT validate conformance — use `fhir_validate_bundle` (later) for that.
+
+    Args:
+        entries: list of `{resource, key?, fullUrl?, request?}`.
+        bundle_type: `"transaction"` (default), `"collection"`, `"batch"`, etc.
+        context_id: build context for `key`→urn resolution (from
+            `fhir_resolve_reference`); omit to mint within a fresh context.
+
+    Returns `{bundle, referenceMap, unresolved}`.
+    """
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    if not isinstance(entries, list) or not entries:
+        return _fhir_env_err("INVALID_ARGUMENT", "entries must be a non-empty list")
+    result = fhir_reference.build_bundle(
+        entries, bundle_type=bundle_type, context_id=context_id
+    )
+    warnings = []
+    if result["unresolved"]:
+        warnings.append(
+            f"{len(result['unresolved'])} reference(s) could not be resolved within the bundle"
+        )
+    return _fhir_env_ok(result, warnings)
+
+
+# ---- Validation (Phase 4 — in-process pre-flight, source:"builtin") --------- #
+
+
+@audited("fhir_validate_resource")
+async def fhir_validate_resource(
+    resource: dict,
+    profile: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """Validate a FHIR resource against an IG profile, in-process. This is a fast,
+    explainable **pre-flight** check (`source:"builtin"`) — the downstream FHIR
+    server remains the authoritative validator. Checks: structure (cardinality /
+    required / choice[x] / fixed / pattern / maxLength), value/pattern slicing,
+    required-binding membership, and FHIRPath invariants. Anything that cannot be
+    verified locally is reported as `warning`/`information`, never a false pass.
+
+    Args:
+        resource: the FHIR resource JSON (must include `resourceType`).
+        profile: profile id / canonical to validate against; omit to use the
+            resource's own `meta.profile`.
+        package_id / version: target IG (omit → default IG).
+
+    Returns `{valid, profile, source, issues:[{severity, path, code, message}]}`.
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.validate_resource(
+        resource=resource, profile=profile, package_id=package_id, version=version
+    )
+
+
+@audited("fhir_validate_bundle")
+async def fhir_validate_bundle(
+    bundle: dict,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """Validate a FHIR Bundle in-process: each entry's resource against its
+    `meta.profile` (same checks as `fhir_validate_resource`) **plus** internal
+    reference integrity — every `urn:uuid:` / `#contained` reference must resolve
+    within the bundle. Pre-flight only (`source:"builtin"`).
+
+    Args:
+        bundle: a FHIR `Bundle` resource.
+        package_id / version: target IG (omit → default IG).
+
+    Returns `{valid, source, entries[], referenceIssues[]}`.
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.validate_bundle(
+        bundle=bundle, package_id=package_id, version=version
+    )
+
+
+# ---- Schema-guided fill / authoring (Phase 5) ------------------------------- #
+
+
+@audited("fhir_get_resource_skeleton")
+async def fhir_get_resource_skeleton(
+    profile: str,
+    package_id: str | None = None,
+    version: str | None = None,
+    candidate_limit: int = 20,
+    include_examples: bool = True,
+) -> str:
+    """Get a blanked, annotated fill-form for authoring a resource against a profile.
+
+    For each element you should fill, returns its path, cardinality (required?/array?),
+    type(s), `choice[x]` JSON property names, the bound ValueSet with **candidate
+    codes**, `mustSupport`, and a short description. `fixed`/`pattern` elements are
+    marked `autoPinned` — the server fills those on finalize; do not set them. Official
+    IG examples are attached as few-shot.
+
+    Workflow: this → fill the semantic blanks (use the terminology tools for codes) →
+    `fhir_finalize_resource(profile, draft)` to pin mechanics + validate.
+
+    Args:
+        profile: profile id (e.g. `"Condition-twcore"`) / canonical / artifact_key.
+        package_id / version: target IG (omit → default IG).
+        candidate_limit: max candidate codes per bound element (default 20, cap 100).
+        include_examples: attach official example instances.
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.get_resource_skeleton(
+        profile=profile,
+        package_id=package_id,
+        version=version,
+        candidate_limit=candidate_limit,
+        include_examples=include_examples,
+    )
+
+
+@audited("fhir_finalize_resource")
+async def fhir_finalize_resource(
+    profile: str,
+    draft: dict,
+    context_id: str | None = None,
+    key: str | None = None,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> str:
+    """Finalize an LLM-filled draft: deterministically pin the *mechanical* fields and
+    validate. The server pins `fixed`/`pattern` values and `meta.profile`, infers a
+    coding's `system` when the bound ValueSet is single-system, rewrites references via
+    the build context, then runs the in-process validator. **It does not auto-loop** —
+    on validation failure, read the issues, fix your draft, and call finalize again.
+
+    Args:
+        profile: profile id / canonical / artifact_key to conform to.
+        draft: your filled resource JSON (semantic blanks filled; leave mechanics out).
+        context_id: build context (from `fhir_resolve_reference`) for key→urn wiring.
+        key: register THIS resource under a logical key so other resources can
+            reference it; returns its minted `urn:uuid` reference.
+        package_id / version: target IG (omit → default IG).
+
+    Returns `{resource, validation, pinned, contextId, reference}`.
+    """
+    if fhir_ig_service is None:
+        return _fhir_ig_unavailable()
+    if await _ig_maintenance_active():
+        return _svc_maintenance("FHIR IG")
+    return await fhir_ig_service.finalize_resource(
+        profile=profile,
+        draft=draft,
+        context_id=context_id,
+        key=key,
+        package_id=package_id,
+        version=version,
     )
 
 
@@ -4151,12 +8424,16 @@ async def search_snomed_concept(
     """
     if snomed_service is None:
         return _svc_unavailable("SNOMED CT")
+    if await _snomed_maintenance_active():
+        return _svc_maintenance("SNOMED CT")
     results = await snomed_service.search_concepts(
         query, min(limit, 10), hierarchy_filter
     )
     if isinstance(results, str):
         return results  # Already JSON string from cache
     return json.dumps(results, ensure_ascii=False, indent=2)
+
+
 @audited("query_snomed_concept")
 async def query_snomed_concept(
     concept_id: int,
@@ -4176,7 +8453,8 @@ async def query_snomed_concept(
     ```json
     {
       "concept_id": 73211009,
-      "concept": {concept_id, fsn, preferred_term, active, definition_status, ...},
+      "concept": {concept_id, fsn, hierarchy_tag, synonyms, active,
+                  definition_status, parents, icd10_maps},
       "ancestor_count": 5,
       "ancestors": [{concept_id, fsn, preferred_term, depth}, ...],
       "children_count": 12,
@@ -4198,6 +8476,8 @@ async def query_snomed_concept(
     """
     if snomed_service is None:
         return _svc_unavailable("SNOMED CT")
+    if await _snomed_maintenance_active():
+        return _svc_maintenance("SNOMED CT")
 
     concept = await snomed_service.get_concept(concept_id)
     if concept is None:
@@ -4221,6 +8501,8 @@ async def query_snomed_concept(
         result["children_count"] = len(children)
         result["children"] = children
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 @audited("get_snomed_relationships")
 async def get_snomed_relationships(
     concept_id: int,
@@ -4250,7 +8532,7 @@ async def get_snomed_relationships(
         {
           "type_id": 363698007,
           "type_label": "Finding site",
-          "targets": [{concept_id, fsn, preferred_term}, ...]
+          "targets": [{concept_id, fsn}, ...]
         }
       ]
     }
@@ -4271,6 +8553,8 @@ async def get_snomed_relationships(
     """
     if snomed_service is None:
         return _svc_unavailable("SNOMED CT")
+    if await _snomed_maintenance_active():
+        return _svc_maintenance("SNOMED CT")
     results = await snomed_service.get_relationships(concept_id, relationship_type_id)
     if isinstance(results, str):
         return results  # Already JSON string from cache
@@ -4283,6 +8567,8 @@ async def get_snomed_relationships(
         ensure_ascii=False,
         indent=2,
     )
+
+
 @audited("query_snomed_mapping")
 async def query_snomed_mapping(
     mode: Literal["icd", "snomed"] = "icd",
@@ -4318,6 +8604,8 @@ async def query_snomed_mapping(
     """
     if snomed_service is None:
         return _svc_unavailable("SNOMED CT")
+    if await _snomed_maintenance_active():
+        return _svc_maintenance("SNOMED CT")
     if mode == "icd":
         if not keyword:
             return _json_error("Provide keyword when mode is icd")
@@ -4348,12 +8636,16 @@ async def query_snomed_mapping(
             indent=2,
         )
     return _json_error("Provide mode as icd or snomed")
+
+
 # ============================================================
 # Service → tool mapping (used by DynamicFastMCP for add/remove)
 # health_check is always registered via @mcp.tool() and is excluded here.
 # ============================================================
 
-_TOOL_CATEGORY_MAP, _TOOL_EXAMPLES, _TOOL_SELECTOR_EXAMPLES, SERVICE_TOOLS = _build_tool_maps()
+_TOOL_CATEGORY_MAP, _TOOL_EXAMPLES, _TOOL_SELECTOR_EXAMPLES, SERVICE_TOOLS = (
+    _build_tool_maps()
+)
 _STATUS_HTML = _build_status_html()
 _STATUS_HTML_BYTES = _STATUS_HTML.encode("utf-8")
 

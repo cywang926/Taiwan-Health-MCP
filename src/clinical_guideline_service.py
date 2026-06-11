@@ -7,17 +7,15 @@ import json
 import re
 from typing import Dict, Optional
 
-import asyncpg
-
 from cache import cached
+from database import PoolLike
 from embedding_service import EmbeddingService
+from search_quality import annotate, embeddings_present
 from utils import log_error, log_info
 
 
 class ClinicalGuidelineService:
-    def __init__(
-        self, pool: asyncpg.Pool, embedding_svc: EmbeddingService | None = None
-    ):
+    def __init__(self, pool: PoolLike, embedding_svc: EmbeddingService | None = None):
         self.pool = pool
         self._embedding_svc = embedding_svc
 
@@ -106,12 +104,17 @@ class ClinicalGuidelineService:
                 },
                 ensure_ascii=False,
             )
+        has_emb = await embeddings_present(self.pool, "guideline.guideline_embeddings")
         return json.dumps(
-            {
-                "keyword": keyword,
-                "total_found": len(rows),
-                "guidelines": [dict(r) for r in rows],
-            },
+            annotate(
+                {
+                    "keyword": keyword,
+                    "total_found": len(rows),
+                    "guidelines": [dict(r) for r in rows],
+                },
+                vec_str,
+                has_emb,
+            ),
             ensure_ascii=False,
         )
 
@@ -344,84 +347,6 @@ class ClinicalGuidelineService:
             ensure_ascii=False,
         )
 
-    @cached(ttl=86400, prefix="gl.linkdrugs")
-    async def link_guideline_to_drugs(self, icd_code: str) -> str:
-        """Cross-reference guideline medication examples with Taiwan FDA approved drugs.
-
-        For each medication example in the guideline for *icd_code*, performs a
-        full-text search against ``drug.licenses`` to find matching licensed products.
-
-        Args:
-            icd_code: ICD-10 code or prefix.
-
-        Returns:
-            JSON string with a ``medications`` list. Each entry includes
-            ``fda_approved_matches`` linking guideline recommendations to real
-            Taiwan FDA licensed products.
-        """
-        async with self.pool.acquire() as conn:
-            med_rows = await conn.fetch(
-                """SELECT mr.line_of_therapy, mr.medication_class,
-                          mr.medication_examples, mr.evidence_level
-                   FROM guideline.medication_recommendations mr
-                   JOIN guideline.disease_guidelines dg ON mr.guideline_id = dg.id
-                   WHERE dg.icd_code = $1 OR dg.icd_code ILIKE $2
-                   ORDER BY mr.line_of_therapy""",
-                icd_code,
-                f"{icd_code}%",
-            )
-            if not med_rows:
-                return json.dumps(
-                    {"error": f"找不到 ICD 碼 '{icd_code}' 的診療指引"},
-                    ensure_ascii=False,
-                )
-
-            results = []
-            for med in med_rows:
-                # Split medication_examples by comma/space and search each
-                examples_raw = med["medication_examples"] or ""
-                # Extract individual drug names (comma/slash/space separated)
-                names = [
-                    n.strip() for n in re.split(r"[,、/；;]", examples_raw) if n.strip()
-                ]
-
-                fda_matches = []
-                for name in names[:5]:  # limit to first 5 per row
-                    if len(name) < 2:
-                        continue
-                    drug_rows = await conn.fetch(
-                        """SELECT license_id, name_zh, name_en, indication
-                           FROM drug.licenses
-                           WHERE to_tsvector('simple',
-                                   COALESCE(name_zh,'') || ' ' || COALESCE(name_en,''))
-                                 @@ plainto_tsquery('simple', $1)
-                           LIMIT 3""",
-                        name,
-                    )
-                    if drug_rows:
-                        fda_matches.extend(
-                            [{**dict(r), "matched_from": name} for r in drug_rows]
-                        )
-
-                results.append(
-                    {
-                        "line_of_therapy": med["line_of_therapy"],
-                        "medication_class": med["medication_class"],
-                        "medication_examples": examples_raw,
-                        "evidence_level": med["evidence_level"],
-                        "fda_approved_matches": fda_matches,
-                    }
-                )
-
-        return json.dumps(
-            {
-                "icd_code": icd_code,
-                "medications": results,
-                "note": "以衛福部核准藥品許可證資料庫比對，結果僅供參考",
-            },
-            ensure_ascii=False,
-        )
-
     async def suggest_clinical_pathway(
         self, icd_code: str, patient_context: Optional[Dict] = None
     ) -> str:
@@ -497,3 +422,21 @@ class ClinicalGuidelineService:
             clinical_pathway["note"] = "臨床路徑應根據個別患者情況調整"
 
         return json.dumps(clinical_pathway, ensure_ascii=False)
+
+    async def health_status(self):
+        from service_health import ServiceHealth, check_embedding_health
+
+        async with self.pool.acquire() as conn:
+            count = int(
+                await conn.fetchval("SELECT COUNT(*) FROM guideline.disease_guidelines")
+                or 0
+            )
+        if count < 1:
+            return ServiceHealth(
+                status="unavailable", reason="Guideline data not loaded"
+            )
+        return await check_embedding_health(
+            self.pool,
+            self._embedding_svc,
+            embed_count_sql="SELECT COUNT(*) FROM guideline.guideline_embeddings",
+        )
