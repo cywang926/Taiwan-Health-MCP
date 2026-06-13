@@ -229,7 +229,8 @@ async def _upsert(pool: asyncpg.Pool, sql: str, rows: list[tuple]) -> None:
     if not rows:
         return
     async with pool.acquire() as conn:
-        await conn.executemany(sql, rows)
+        async with conn.transaction():
+            await conn.executemany(sql, rows)
 
 
 def _text_hash(text: str) -> str:
