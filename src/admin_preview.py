@@ -2507,6 +2507,8 @@ async def preview_guideline(
     *,
     id_: int | None = None,
     q: str | None = None,
+    page: int = 1,
+    per_page: int = 50,
 ) -> dict[str, Any]:
     """Clinical guidelines preview.
 
@@ -2543,21 +2545,24 @@ async def preview_guideline(
                 """,
                 term,
             )
+            search_rows = [
+                {
+                    "id": r["id"],
+                    "icd_code": r["icd_code"],
+                    "disease_name_zh": r["disease_name_zh"] or "",
+                    "disease_name_en": r["disease_name_en"] or "",
+                    "guideline_title": r["guideline_title"] or "",
+                    "guideline_source": r["guideline_source"] or "",
+                    "publication_year": r["publication_year"],
+                }
+                for r in rows
+            ]
             return {
                 "type": "search",
                 "query": q.strip(),
-                "results": [
-                    {
-                        "id": r["id"],
-                        "icd_code": r["icd_code"],
-                        "disease_name_zh": r["disease_name_zh"] or "",
-                        "disease_name_en": r["disease_name_en"] or "",
-                        "guideline_title": r["guideline_title"] or "",
-                        "guideline_source": r["guideline_source"] or "",
-                        "publication_year": r["publication_year"],
-                    }
-                    for r in rows
-                ],
+                "results": search_rows,
+                "rows": search_rows,
+                "total": len(search_rows),
             }
 
         # ── Full guideline detail ──────────────────────────────────────────
@@ -2622,21 +2627,23 @@ async def preview_guideline(
             FROM guideline.disease_guidelines
             ORDER BY icd_code
             """)
+        disease_rows = [
+            {
+                "id": r["id"],
+                "icd_code": r["icd_code"],
+                "disease_name_zh": r["disease_name_zh"] or "",
+                "disease_name_en": r["disease_name_en"] or "",
+                "guideline_title": r["guideline_title"] or "",
+                "guideline_source": r["guideline_source"] or "",
+                "publication_year": r["publication_year"],
+            }
+            for r in rows
+        ]
         return {
             "type": "list",
             "total": total,
-            "diseases": [
-                {
-                    "id": r["id"],
-                    "icd_code": r["icd_code"],
-                    "disease_name_zh": r["disease_name_zh"] or "",
-                    "disease_name_en": r["disease_name_en"] or "",
-                    "guideline_title": r["guideline_title"] or "",
-                    "guideline_source": r["guideline_source"] or "",
-                    "publication_year": r["publication_year"],
-                }
-                for r in rows
-            ],
+            "diseases": disease_rows,
+            "rows": disease_rows,
         }
 
 
