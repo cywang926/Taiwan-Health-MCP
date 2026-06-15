@@ -72,8 +72,8 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
                 "ollama",
                 "EMBEDDING_PROVIDER",
                 "Provider",
-                options=["ollama", "openai", "google"],
-                help="ollama = local Ollama; openai = OpenAI-compatible /v1; google = Gemini API.",
+                options=["ollama", "openai", "google", "azure"],
+                help="ollama = local Ollama; openai = OpenAI-compatible /v1; google = Gemini API; azure = Azure OpenAI.",
             ),
             _field(
                 "base_url",
@@ -85,12 +85,30 @@ SETTINGS_SCHEMA: dict[str, dict[str, Any]] = {
                 help="Ollama host (…:11434) or the OpenAI-compatible /v1 root. (Google uses a fixed endpoint.)",
             ),
             _field(
+                "azure_endpoint",
+                "str",
+                "",
+                "AZURE_OPENAI_ENDPOINT",
+                "Azure Endpoint",
+                show_if={"provider": ["azure"]},
+                help="Your Azure OpenAI resource endpoint, e.g. https://myresource.openai.azure.com",
+            ),
+            _field(
                 "api_key",
                 "secret",
                 "",
                 "EMBEDDING_API_KEY",
                 "API Key",
-                show_if={"provider": ["openai", "google"]},
+                show_if={"provider": ["openai", "google", "azure"]},
+            ),
+            _field(
+                "api_version",
+                "str",
+                "2024-02-01",
+                "AZURE_OPENAI_API_VERSION",
+                "API Version",
+                show_if={"provider": ["azure"]},
+                help="Azure OpenAI API version, e.g. 2024-02-01",
             ),
             _field(
                 "model",
@@ -641,6 +659,16 @@ async def list_models(
             return await _openai_models(base, key)
         if provider == "google":
             return await _google_embedding_models(key)
+        if provider == "azure":
+            return {
+                "ok": True,
+                "models": [
+                    "text-embedding-3-small",
+                    "text-embedding-3-large",
+                    "text-embedding-ada-002",
+                ],
+                "message": "Enter your Azure deployment name in the Model field.",
+            }
         return await _ollama_tags(base)
     if group == "analysis":
         provider = str(draft.get("provider", "openai") or "openai").lower()
@@ -780,21 +808,31 @@ async def _test_embedding(draft: dict[str, Any]) -> dict[str, Any]:
 
     provider = str(draft.get("provider", "ollama") or "ollama").lower()
     base = str(draft.get("base_url", "") or "").rstrip("/")
+    azure_endpoint = str(draft.get("azure_endpoint", "") or "").rstrip("/")
     model = str(draft.get("model", "") or "")
     key = str(draft.get("api_key", "") or "")
+    api_version = str(draft.get("api_version", "2024-02-01") or "2024-02-01")
     want_dim = int(draft.get("dimensions", 0) or 0)
     if not model:
         return {"ok": False, "message": "Model is required."}
-    if provider in ("openai", "google") and not key:
+    if provider in ("openai", "google", "azure") and not key:
         return {"ok": False, "message": "API key is required for this provider."}
     if provider in ("ollama", "openai") and not base:
         return {"ok": False, "message": "Base URL is required."}
+    if provider == "azure" and not azure_endpoint:
+        return {"ok": False, "message": "Azure Endpoint is required."}
     # Generous timeout: a cold embedding model can take 10-30s to load on first call.
     timeout = max(float(draft.get("timeout", 30) or 30), 90.0)
     try:
         t0 = _time.perf_counter()
         async with httpx.AsyncClient(timeout=timeout) as c:
-            if provider == "openai":
+            if provider == "azure":
+                url = f"{azure_endpoint}/openai/deployments/{model}/embeddings?api-version={api_version}"
+                body = {"input": ["health check"], "encoding_format": "float"}
+                r = await c.post(url, json=body, headers={"api-key": key})
+                r.raise_for_status()
+                vec = (r.json().get("data") or [{}])[0].get("embedding")
+            elif provider == "openai":
                 url = base if base.endswith("/embeddings") else f"{base}/embeddings"
                 body = {
                     "model": model,

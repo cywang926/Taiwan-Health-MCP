@@ -33,7 +33,7 @@ def configure(values: dict) -> None:
     """Override the Ollama embedding settings from a DB settings dict
     (admin_settings 'embedding' group). Called at startup and on settings save
     so query-time semantic search picks up changes without a restart."""
-    global _BASE_URL, _MODEL, _TIMEOUT, BATCH_SIZE, DIMENSIONS, _PROVIDER, _API_KEY
+    global _BASE_URL, _MODEL, _TIMEOUT, BATCH_SIZE, DIMENSIONS, _PROVIDER, _API_KEY, _AZURE_ENDPOINT, _AZURE_API_VERSION
     _PROVIDER = str(values.get("provider", "ollama") or "ollama").strip().lower()
     _BASE_URL = str(values.get("base_url", "") or "").rstrip("/")
     _API_KEY = str(values.get("api_key", "") or "")
@@ -41,10 +41,14 @@ def configure(values: dict) -> None:
     _TIMEOUT = float(values.get("timeout", 30) or 30)
     BATCH_SIZE = int(values.get("batch_size", 32) or 32)
     DIMENSIONS = int(values.get("dimensions", 1024) or 1024)
+    _AZURE_ENDPOINT = str(values.get("azure_endpoint", "") or "").rstrip("/")
+    _AZURE_API_VERSION = str(values.get("api_version", "2024-02-01") or "2024-02-01")
 
 
 _PROVIDER: str = "ollama"
 _API_KEY: str = ""
+_AZURE_ENDPOINT: str = ""
+_AZURE_API_VERSION: str = "2024-02-01"
 _GOOGLE_BASE = "https://generativelanguage.googleapis.com"
 
 
@@ -52,11 +56,20 @@ def _configured() -> bool:
     """Whether the embedding provider has enough config to attempt a call."""
     if _PROVIDER == "ollama":
         return bool(_BASE_URL)
+    if _PROVIDER == "azure":
+        return bool(_AZURE_ENDPOINT and _MODEL and _API_KEY)
     return bool(_MODEL and _API_KEY)
 
 
 async def _provider_embed(client, texts: list[str]) -> list:
     """Embed a batch via the configured provider. Raises on HTTP error."""
+    if _PROVIDER == "azure":
+        url = f"{_AZURE_ENDPOINT}/openai/deployments/{_MODEL}/embeddings?api-version={_AZURE_API_VERSION}"
+        body: dict = {"input": texts, "encoding_format": "float"}
+        resp = await client.post(url, json=body, headers={"api-key": _API_KEY})
+        resp.raise_for_status()
+        data = sorted(resp.json().get("data", []), key=lambda d: d.get("index", 0))
+        return [d.get("embedding") for d in data]
     if _PROVIDER == "openai":
         base = (
             _BASE_URL
@@ -128,7 +141,7 @@ class EmbeddingService:
                 async with httpx.AsyncClient(timeout=3.0) as client:
                     r = await client.get(f"{_BASE_URL}/api/version")
                     return r.status_code == 200
-            # openai / google: a successful 1-item embed is the cheapest real check
+            # openai / google / azure: a successful 1-item embed is the cheapest real check
             async with httpx.AsyncClient(timeout=8.0) as client:
                 out = await _provider_embed(client, ["ping"])
                 return bool(out and out[0])
